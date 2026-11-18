@@ -1,0 +1,347 @@
+/* 五种工作台共享结构；尺寸类在布局变体之后覆盖。 */
+Screen {
+    layout: vertical;
+    background: #0c0d10;
+    color: #e4e7ec;
+    layers: base menu;
+    overflow: hidden hidden;
+    link-color: #75a7ff;
+    link-style: none;
+}
+
+#masthead {
+    width: 1fr;
+    height: 1;
+    padding: 0 1;
+    background: #191c22;
+    color: #858d9a;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden hidden;
+}
+
+#workspace {
+    width: 1fr;
+    height: 1fr;
+    min-width: 0;
+    min-height: 1;
+    overflow: hidden hidden;
+}
+
+#main-area {
+    width: 1fr;
+    height: 1fr;
+    min-width: 0;
+    min-height: 1;
+    overflow: hidden hidden;
+}
+
+Pane {
+    width: 1fr;
+    min-width: 0;
+    min-height: 3;
+    padding: 0 1;
+    border: solid #292e38;
+    border-title-color: #858d9a;
+    border-title-background: #13161c;
+    background: #13161c;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size: 1 1;
+    scrollbar-background: #13161c;
+    scrollbar-background-hover: #191e27;
+    scrollbar-background-active: #191e27;
+    scrollbar-color: #343d4b;
+    scrollbar-color-hover: #56647a;
+    scrollbar-color-active: #75a7ff;
+}
+
+Pane:focus-within { border: solid #45546b; }
+
+Pane > Static.content {
+    width: 1fr;
+    min-width: 0;
+    height: auto;
+    text-wrap: wrap;
+    text-overflow: fold;
+    overflow-x: hidden;
+}
+
+#map-pane { height: 12; }
+#reading-pane { height: 1fr; }
+
+#sidebar {
+    width: 32;
+    height: 1fr;
+    min-width: 0;
+    min-height: 1;
+    border-left: solid #292e38;
+    background: #13161c;
+    overflow: hidden hidden;
+}
+
+/* 两行卡片由共享模型生成，列表负责选择及键盘焦点。 */
+#node-cards, #command-menu, #worker-options {
+    min-width: 0;
+    min-height: 1;
+    border: none;
+    padding: 0;
+    background: #13161c;
+    color: #e4e7ec;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size: 1 1;
+    scrollbar-background: #13161c;
+    scrollbar-color: #343d4b;
+    scrollbar-color-hover: #56647a;
+    scrollbar-color-active: #75a7ff;
+}
+
+#node-cards:focus, #command-menu:focus, #worker-options:focus {
+    border: none;
+    background-tint: transparent;
+}
+
+#node-cards {
+    width: 1fr;
+    height: 1fr;
+}
+
+#node-cards > .option-list--option,
+#command-menu > .option-list--option,
+#worker-options > .option-list--option {
+    padding: 0 1;
+}
+
+#node-cards > .option-list--option-hover,
+#command-menu > .option-list--option-hover,
+#worker-options > .option-list--option-hover {
+    background: #1b222d;
+}
+
+#node-cards > .option-list--option-highlighted,
+#node-cards:focus > .option-list--option-highlighted,
+#command-menu > .option-list--option-highlighted,
+#command-menu:focus > .option-list--option-highlighted,
+#worker-options > .option-list--option-highlighted,
+#worker-options:focus > .option-list--option-highlighted {
+    background: #213650;
+    color: #75a7ff;
+    text-style: bold;
+}
+
+#assembly-hint {
+    width: 1fr;
+    min-width: 0;
+    height: auto;
+    padding: 1 1 0 1;
+    border-top: solid #292e38;
+    color: #858d9a;
+    background: #13161c;
+    text-wrap: wrap;
+    text-overflow: fold;
+    overflow-x: hidden;
+}
+
+/* 命令建议覆盖工作区，输入区始终保留三行。 */
+#command-menu {
+    layer: menu;
+    dock: bottom;
+    offset: 0 -3;
+    width: 100%;
+    height: auto;
+    max-height: 12;
+    border: solid #45546b;
+}
+
+#command-menu:focus { border: solid #75a7ff; }
+
+#composer {
+    width: 1fr;
+    height: 3;
+    min-width: 0;
+    padding: 0 1;
+    border-left: solid #75a7ff;
+    background: #13161c;
+    overflow: hidden hidden;
+}
+
+#prompt, #prompt:focus, #prompt.-invalid, #prompt.-invalid:focus {
+    width: 1fr;
+    min-width: 0;
+    height: 1;
+    min-height: 1;
+    padding: 0;
+    border: none;
+    background: #13161c;
+    background-tint: transparent;
+    color: #e4e7ec;
+}
+
+#prompt > .input--placeholder, #prompt > .input--suggestion {
+    color: #858d9a;
+}
+
+#input-meta {
+    width: 1fr;
+    min-width: 0;
+    height: 1;
+    color: #858d9a;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden hidden;
+}
+
+.waiting { color: #858d9a; }
+.running { color: #fab283; }
+.completed { color: #e4e7ec; }
+.defeat { color: #e6a0a3; }
+
+/* harbor：上下画布与正文，细线框建立安静的工作区。 */
+Screen.harbor #sidebar { width: 32; }
+Screen.harbor #map-pane { height: 10; }
+
+/* ribbon：短画布与横向分隔，增加终端中的可读行数。 */
+Screen.ribbon #sidebar { width: 28; }
+Screen.ribbon #map-pane { height: 8; }
+Screen.ribbon Pane, Screen.ribbon Pane:focus-within {
+    border: none;
+    border-bottom: solid #292e38;
+    background: #0c0d10;
+    border-title-background: #0c0d10;
+}
+
+/* flux：蓝色画布边界突出依赖与当前运行路径。 */
+Screen.flux #sidebar { width: 34; }
+Screen.flux #map-pane {
+    height: 11;
+    border: solid #75a7ff;
+    border-title-color: #75a7ff;
+}
+
+/* folio：正文为连续单栏文本，使用略浅的阅读底色。 */
+Screen.folio #sidebar { width: 28; }
+Screen.folio #map-pane {
+    height: 7;
+    border: none;
+    border-bottom: solid #292e38;
+    background: #0c0d10;
+    border-title-background: #0c0d10;
+}
+Screen.folio #reading-pane {
+    padding: 0 2;
+    border: none;
+    background: #1b1e25;
+    border-title-background: #1b1e25;
+    scrollbar-background: #1b1e25;
+}
+
+/* ledger：正文沿终端自然展开，左右留出两格空间。 */
+Screen.ledger #sidebar { width: 30; }
+Screen.ledger #main-area { padding: 0 2; }
+Screen.ledger #map-pane { height: 9; dock: bottom; }
+Screen.ledger Pane, Screen.ledger Pane:focus-within {
+    padding: 0;
+    border: none;
+    background: #0c0d10;
+    border-title-background: #0c0d10;
+    scrollbar-background: #0c0d10;
+}
+
+/* 窄屏仍保留可选节点；主区允许收缩到实际剩余宽度。 */
+Screen.narrow #sidebar { width: 26; }
+Screen.narrow #map-pane, Screen.tiny #map-pane { height: 10; }
+Screen.ribbon.narrow #map-pane, Screen.folio.narrow #map-pane,
+Screen.ribbon.tiny #map-pane, Screen.folio.tiny #map-pane {
+    height: 7;
+}
+Screen.tiny #sidebar { width: 21; }
+Screen.tiny #main-area { padding: 0; }
+Screen.tiny Pane { padding: 0; }
+Screen.tiny #reading-pane { padding: 0; }
+
+/* 模态框复用工作台色板，保留文本输入和列表操作。 */
+WorkerPicker, FlowEditor {
+    align: center middle;
+    background: #000000 75%;
+    overflow: hidden hidden;
+}
+
+#picker-box {
+    width: 68;
+    max-width: 95%;
+    height: auto;
+    max-height: 85%;
+    min-width: 0;
+    padding: 0 1;
+    border: solid #75a7ff;
+    background: #13161c;
+    overflow: hidden auto;
+}
+
+#picker-title, #editor-title {
+    width: 1fr;
+    min-width: 0;
+    height: 2;
+    color: #75a7ff;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden hidden;
+}
+
+#worker-filter, #worker-filter:focus {
+    width: 1fr;
+    min-width: 0;
+    height: 3;
+    padding: 0 1;
+    border: solid #45546b;
+    color: #e4e7ec;
+    background: #0c0d10;
+    background-tint: transparent;
+}
+
+#worker-filter:focus { border: solid #75a7ff; }
+#worker-filter > .input--placeholder { color: #858d9a; }
+
+#worker-options {
+    width: 1fr;
+    height: auto;
+    max-height: 15;
+}
+
+#picker-hint, #editor-hint {
+    width: 1fr;
+    min-width: 0;
+    height: 2;
+    color: #858d9a;
+    text-wrap: wrap;
+    text-overflow: fold;
+    overflow: hidden hidden;
+}
+
+#editor-box {
+    width: 90;
+    max-width: 96%;
+    height: 85%;
+    min-width: 0;
+    min-height: 8;
+    padding: 0 1;
+    border: solid #75a7ff;
+    background: #13161c;
+    overflow: hidden hidden;
+}
+
+#flow-editor, #flow-editor:focus {
+    width: 1fr;
+    min-width: 0;
+    height: 1fr;
+    min-height: 1;
+    border: solid #343d4b;
+    color: #e4e7ec;
+    background: #0c0d10;
+    scrollbar-size: 1 1;
+    scrollbar-background: #0c0d10;
+    scrollbar-color: #343d4b;
+}
+
+#flow-editor:focus { border: solid #75a7ff; }

@@ -1,0 +1,13 @@
+{
+  "model": "qwen3.8-max",
+  "models": ["qwen3.8-max", "qwen3.8-flash"],
+  "workspace": "..",
+  "data_dir": "../data",
+  "concurrency": 3,
+  "timeout": 60,
+  "max_tokens": 1200,
+  "max_tool_rounds": 4,
+  "currency": "CNY",
+  "prices": {},
+  "mcp_servers": {}
+}

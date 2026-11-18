@@ -1,0 +1,84 @@
+.variant-focus {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #101011;
+  color: var(--ink);
+}
+.variant-focus .focus-scroll { flex: 1; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
+.variant-focus .focus-column { width: min(100%, 970px); margin: 0 auto; padding: 18px 48px 28px; box-sizing: border-box; }
+.variant-focus .focus-session-line { display: flex; align-items: center; justify-content: space-between; gap: 20px; color: var(--dim); }
+.variant-focus .focus-session-label { display: inline-flex; gap: 8px; align-items: center; font: 10px var(--mono); letter-spacing: 1.6px; }
+.variant-focus .focus-session-line button { color: var(--muted); font-size: 11px; }
+.variant-focus .focus-welcome { padding: clamp(28px, 6vh, 70px) 0 24px; }
+.variant-focus .focus-wordmark { font: 500 clamp(30px, 4vw, 48px)/1.2 var(--mono); letter-spacing: -3px; color: #fafafa; }
+.variant-focus .focus-wordmark > span:first-child { color: var(--accent); }
+.variant-focus .focus-wordmark .focus-cursor { color: #77777c; margin-left: 6px; font-weight: 300; font-size: 0.68em; vertical-align: 4px; }
+.variant-focus .focus-welcome-kicker { color: var(--dim); font: 9px var(--mono); letter-spacing: 2.2px; margin: 15px 0 32px; }
+.variant-focus .focus-welcome h1 { font-size: clamp(23px, 3vw, 32px); font-weight: 450; letter-spacing: 0.4px; margin: 0 0 12px; }
+.variant-focus .focus-intro { font-size: 13px; line-height: 1.8; color: var(--muted); margin: 0; max-width: 580px; }
+.variant-focus .focus-starters { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 28px; }
+.variant-focus .focus-starters button { display: inline-flex; align-items: center; gap: 9px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 3px; background: transparent; color: var(--muted); font: 11px var(--mono); cursor: pointer; }
+.variant-focus .focus-starters button:hover { color: var(--ink); border-color: #77716d; background: #191817; }
+.variant-focus .focus-starters button > svg:last-child { margin-left: 10px; color: var(--dim); }
+.variant-focus .focus-task { margin: 30px 0 26px; }
+.variant-focus .focus-task .eyebrow { font-size: 9px; color: var(--dim); letter-spacing: 1.8px; }
+.variant-focus .focus-task h1 { margin: 12px 0 10px; font-size: 23px; line-height: 1.5; font-weight: 450; overflow-wrap: anywhere; }
+.variant-focus .focus-task p { font: 11px/1.5 var(--mono); color: var(--muted); margin: 0; }
+.variant-focus .focus-task p > span { padding: 0 8px; color: var(--dim); }
+.variant-focus .focus-conversation { min-height: 0; overflow: visible; }
+.variant-focus .focus-conversation > * { height: auto; min-height: 0; overflow: visible; }
+.variant-focus .focus-workflow { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 18px; }
+.variant-focus .focus-workflow-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.variant-focus .focus-run-title { display: inline-flex; align-items: center; gap: 9px; font-size: 12px; }
+.variant-focus .focus-run-title strong { font-weight: 500; }
+.variant-focus .focus-count { color: var(--dim); margin-left: 6px; font: 10px var(--mono); }
+.variant-focus .focus-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); flex: none; }
+.variant-focus .focus-status-dot[data-status="running"], .variant-focus .focus-status-dot[data-status="review"] { background: var(--accent); }
+.variant-focus .focus-status-dot[data-status="failed"] { background: var(--bad); }
+.variant-focus .focus-status-dot[data-status="completed"] { background: var(--good); }
+.variant-focus .focus-activity-line { margin: 10px 0 14px 15px; font-size: 11px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }
+.variant-focus .focus-progress { margin-bottom: 14px; }
+.variant-focus .focus-flow-details { border: 1px solid #2b2b30; border-radius: 3px; background: #141415; }
+.variant-focus .focus-flow-details summary { cursor: pointer; display: flex; justify-content: space-between; gap: 16px; padding: 12px 14px; list-style: none; color: var(--muted); font-size: 11px; }
+.variant-focus .focus-flow-details summary::-webkit-details-marker { display: none; }
+.variant-focus .focus-flow-details summary > span { display: inline-flex; align-items: center; gap: 8px; }
+.variant-focus .focus-flow-details summary > span:last-child { color: var(--dim); font-size: 10px; }
+.variant-focus .focus-flow-details[open] summary { border-bottom: 1px solid #27272b; }
+.variant-focus .focus-flow-body { min-height: 0; padding: 10px 12px 4px; }
+.variant-focus .focus-graph { max-height: 190px; overflow: auto; min-height: 0; }
+.variant-focus .focus-node-strip { max-height: 120px; overflow: auto; margin-top: 8px; }
+.variant-focus .focus-flow-actions { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; border-top: 1px solid #262629; margin-top: 8px; padding: 8px 0; }
+.variant-focus .focus-flow-actions button { font-size: 10px; }
+.variant-focus .focus-result-line { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding-top: 12px; color: var(--dim); font: 10px var(--mono); }
+.variant-focus .focus-result-line > span { min-width: 0; }
+.variant-focus .focus-result-line button { font-size: 11px; color: var(--accent); }
+.variant-focus .focus-attention { border-top-color: #765541; }
+.variant-focus .focus-input-dock { flex: none; background: #101011; padding: 10px 0 9px; }
+.variant-focus .focus-input-column { width: min(100%, 970px); margin: 0 auto; padding: 0 48px; box-sizing: border-box; }
+.variant-focus .focus-input-caption { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 9px 3px 0; font: 9px var(--mono); color: var(--dim); }
+.variant-focus .focus-input-caption > span { display: inline-flex; align-items: center; gap: 6px; }
+.variant-focus .focus-caption-separator { margin: 0 5px; }
+.variant-focus .focus-input-caption button { color: var(--dim); font-size: 9px; padding: 0; }
+.variant-focus button:focus-visible, .variant-focus summary:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 1050px) {
+  .variant-focus .focus-column { max-width: 850px; padding-left: 32px; padding-right: 32px; }
+  .variant-focus .focus-input-column { max-width: 850px; padding-left: 32px; padding-right: 32px; }
+}
+@media (max-width: 640px) {
+  .variant-focus .focus-column { padding: 14px 18px 20px; }
+  .variant-focus .focus-input-column { padding: 0 14px; }
+  .variant-focus .focus-session-label { font-size: 9px; letter-spacing: 1px; }
+  .variant-focus .focus-welcome { padding-top: 30px; }
+  .variant-focus .focus-welcome-kicker { margin-bottom: 25px; letter-spacing: 1.3px; }
+  .variant-focus .focus-starters { flex-direction: column; align-items: stretch; margin-top: 22px; }
+  .variant-focus .focus-starters button { justify-content: flex-start; }
+  .variant-focus .focus-starters button > svg:last-child { margin-left: auto; }
+  .variant-focus .focus-task { margin-top: 22px; }
+  .variant-focus .focus-task h1 { font-size: 19px; }
+  .variant-focus .focus-flow-details summary > span:last-child { font-size: 0; gap: 0; }
+  .variant-focus .focus-input-caption { font-size: 8px; gap: 5px; }
+  .variant-focus .focus-caption-separator { margin: 0 1px; }
+}

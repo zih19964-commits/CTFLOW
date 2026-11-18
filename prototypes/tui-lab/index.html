@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23171719'/%3E%3Cpath d='m8 20 8-9 8 9' fill='none' stroke='%23fab283' stroke-width='3'/%3E%3C/svg%3E">
+  <title>CTflow — 五种工作方式</title>
+  <link rel="stylesheet" href="base.css">
+  <link rel="stylesheet" href="focus.css">
+  <link rel="stylesheet" href="rail.css">
+  <link rel="stylesheet" href="canvas.css">
+  <link rel="stylesheet" href="pulse.css">
+  <link rel="stylesheet" href="studio.css">
+</head>
+<body>
+  <div id="lab">
+    <header class="lab-heading">
+      <div class="lab-wordmark">CT<span>flow</span><span class="lab-divider">/</span><span class="lab-title">交互实验室</span></div>
+      <div class="lab-heading-right"><span class="simulation-label"><span></span>可玩原型 · 本地模拟</span><button class="plain-button" data-action="guide">试玩指南 <kbd>?</kbd></button></div>
+    </header>
+    <nav id="variants" class="variant-tabs" aria-label="五套交互方案"></nav>
+    <section class="terminal-window" aria-label="CTflow 交互原型">
+      <div id="appbar"></div>
+      <main id="stage"></main>
+      <footer id="statusbar" class="statusbar"></footer>
+    </section>
+    <div class="lab-caption"><span id="design-intent"></span><span>交互参考 Grok Build · 色彩融合 OpenCode / Grok</span></div>
+  </div>
+  <div id="overlay-root"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script>window.CTflowVariants = {};</script>
+  <script src="focus.js"></script>
+  <script src="rail.js"></script>
+  <script src="canvas.js"></script>
+  <script src="pulse.js"></script>
+  <script src="studio.js"></script>
+  <script src="demo-engine.js"></script>
+  <script src="components.js"></script>
+  <script src="runtime.js"></script>
+</body>
+</html>

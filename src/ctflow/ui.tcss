@@ -1,0 +1,195 @@
+/* FLUX：蓝色画布、输出区、右侧节点和底部命令。 */
+Screen {
+    layout: vertical;
+    background: #0c0d10;
+    color: #e4e7ec;
+    layers: base menu;
+    overflow: hidden hidden;
+    link-color: #75a7ff;
+    link-style: none;
+}
+#masthead {
+    width: 1fr;
+    height: 1;
+    padding: 0 1;
+    background: #191c22;
+    color: #858d9a;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+#workspace { width: 1fr; height: 1fr; min-height: 1; }
+#main-area { width: 1fr; height: 1fr; min-width: 0; min-height: 1; }
+Pane {
+    width: 1fr;
+    min-width: 0;
+    min-height: 3;
+    padding: 0 1;
+    border: solid #292e38;
+    border-title-color: #858d9a;
+    border-title-background: #13161c;
+    background: #13161c;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size: 1 1;
+    scrollbar-background: #13161c;
+    scrollbar-color: #343d4b;
+    scrollbar-color-hover: #56647a;
+    scrollbar-color-active: #75a7ff;
+}
+Pane > Static.content {
+    width: 1fr;
+    min-width: 0;
+    height: auto;
+    text-wrap: wrap;
+    overflow-x: hidden;
+}
+#map-pane Static {
+    link-style: none;
+    link-style-hover: none;
+}
+#map-pane {
+    height: 13;
+    border: solid #75a7ff;
+    border-title-color: #75a7ff;
+}
+#reading-pane { height: 1fr; }
+#sidebar {
+    width: 34;
+    height: 1fr;
+    min-width: 0;
+    border-left: solid #292e38;
+    background: #13161c;
+}
+OptionList, SelectionList {
+    min-width: 0;
+    min-height: 1;
+    border: none;
+    padding: 0;
+    background: #13161c;
+    color: #e4e7ec;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size: 1 1;
+    scrollbar-background: #13161c;
+    scrollbar-color: #343d4b;
+}
+OptionList:focus, SelectionList:focus { border: none; background-tint: transparent; }
+OptionList > .option-list--option { padding: 0 1; }
+OptionList > .option-list--option-hover { background: #1b222d; }
+OptionList > .option-list--option-highlighted {
+    background: #213650;
+    color: #75a7ff;
+    text-style: bold;
+}
+#node-cards { height: 1fr; }
+#assembly-hint {
+    height: auto;
+    max-height: 10;
+    padding: 1 1 0 1;
+    border-top: solid #292e38;
+    color: #858d9a;
+    text-wrap: wrap;
+}
+#command-menu {
+    layer: menu;
+    dock: bottom;
+    offset: 0 -3;
+    width: 100%;
+    height: auto;
+    max-height: 12;
+    border: solid #45546b;
+}
+#composer {
+    width: 1fr;
+    height: 3;
+    min-width: 0;
+    padding: 0 1;
+    border-left: solid #75a7ff;
+    background: #13161c;
+}
+#prompt, #prompt:focus {
+    height: 1;
+    min-height: 1;
+    padding: 0;
+    border: none;
+    background: #13161c;
+    background-tint: transparent;
+}
+#input-meta {
+    height: 1;
+    color: #858d9a;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+Screen.compact #sidebar { width: 25; }
+Screen.short #map-pane { height: 9; }
+Screen.short #assembly-hint { max-height: 6; padding: 0 1; }
+
+Dialog {
+    align: center middle;
+    background: #000000 55%;
+}
+.dialog {
+    width: 86%;
+    max-width: 100;
+    height: 90%;
+    max-height: 38;
+    padding: 0 1;
+    border: solid #75a7ff;
+    background: #13161c;
+}
+.dialog-heading { height: 2; min-height: 2; }
+.dialog-title {
+    width: 1fr;
+    height: 1;
+    color: #75a7ff;
+    text-style: bold;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+#dialog-close, #dialog-close:focus {
+    width: 3;
+    min-width: 3;
+    height: 1;
+    min-height: 1;
+    padding: 0;
+    border: none;
+    background: #13161c;
+    color: #858d9a;
+}
+#dialog-close:hover { color: #f28b91; background: #263448; }
+#dialog-fields {
+    height: 1fr;
+    min-height: 1;
+    overflow-x: hidden;
+    scrollbar-size: 1 1;
+    scrollbar-color: #343d4b;
+}
+#dialog-fields Label { height: auto; margin: 1 0 0 0; color: #858d9a; }
+#dialog-fields Input, #dialog-fields Select { height: 3; margin: 0; }
+#refresh-models {
+    height: 3;
+    min-height: 3;
+    margin: 0;
+    background: #213650;
+    color: #75a7ff;
+    border: none;
+}
+#dialog-fields Input, #dialog-fields TextArea, #dialog-fields SelectCurrent {
+    background: #191e27;
+    border: solid #343d4b;
+}
+#dialog-fields Input:focus, #dialog-fields TextArea:focus { border: solid #75a7ff; }
+#dialog-fields TextArea { height: 7; min-height: 5; }
+#dialog-fields #field-source { height: 15; }
+#dialog-fields #field-extra_body { height: 5; }
+#skill-options { height: auto; min-height: 3; max-height: 10; margin: 1 0; }
+#picker-options { height: auto; min-height: 4; max-height: 20; margin: 1 0; }
+#form-error { height: auto; max-height: 3; color: #f28b91; }
+.dialog-footer {
+    height: 1;
+    min-height: 1;
+    color: #858d9a;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
