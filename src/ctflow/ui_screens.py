@@ -33,13 +33,14 @@ from ctflow.tools import discover_skills, read_skills
 
 
 def _next_node_id(existing: set[str]) -> str:
-    """按 A..Z、N1..N99 顺序生成不冲突的节点 ID。"""
+    """按 A..Z、N1..N99 顺序生成不与现有节点（含大小写）冲突的节点 ID。"""
+    folded = {item.casefold() for item in existing}
     for code in range(ord("A"), ord("Z") + 1):
         candidate = chr(code)
-        if candidate not in existing:
+        if candidate.casefold() not in folded:
             return candidate
     index = 1
-    while f"N{index}" in existing:
+    while f"n{index}" in folded:
         index += 1
     return f"N{index}"
 
@@ -137,7 +138,11 @@ def _build_template_nodes(kind: str, workers: list[Worker]) -> list[Node]:
 class Dialog(ModalScreen):
     """圆角模态对话框基类：固定标题、关闭键与底栏，字段区独立滚动。"""
 
-    BINDINGS = [Binding("escape", "cancel", "取消", priority=True)]
+    BINDINGS = [
+        Binding("escape", "cancel", "取消", priority=True),
+        Binding("pageup", "page_up", show=False, priority=True),
+        Binding("pagedown", "page_down", show=False, priority=True),
+    ]
 
     def __init__(self, title: str, *, wide: bool = False) -> None:
         super().__init__()
@@ -160,6 +165,25 @@ class Dialog(ModalScreen):
                 yield from self.body()
             yield Static("", id="form-error", markup=False)
             yield Static(self.footer_hint(), classes="dialog-footer", markup=False)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # 子控件（如长源码框或长列表）还可朝对应方向翻页时优先自行处理，到边界后再滚动外层弹窗。
+        if action in {"page_up", "page_down"}:
+            focused = self.focused
+            if focused is not None and focused.id != "dialog-fields":
+                max_y = getattr(focused, "max_scroll_y", 0)
+                cur_y = getattr(focused, "scroll_y", 0)
+                if action == "page_up" and max_y > 0 and cur_y > 0:
+                    return False
+                if action == "page_down" and max_y > 0 and cur_y < max_y:
+                    return False
+        return True
+
+    def action_page_up(self) -> None:
+        self.query_one("#dialog-fields", VerticalScroll).scroll_page_up(animate=False)
+
+    def action_page_down(self) -> None:
+        self.query_one("#dialog-fields", VerticalScroll).scroll_page_down(animate=False)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -334,7 +358,7 @@ class WorkerScreen(FormScreen):
 
         yield Label(f"@{self.worker.id} 可用模型 · 使用上方连接草稿刷新")
         with Horizontal(classes="action-row"):
-            yield Button("↻ 刷新模型", id="refresh-models", classes="btn-primary")
+            yield Button("刷新模型", id="refresh-models", classes="btn-primary")
             yield Button("清空 extra_body", id="reset-extra", classes="btn-subtle")
         options = [(m, m) for m in self.models]
         selected_val = self.worker.model if self.worker.model in self.models else Select.BLANK
@@ -547,7 +571,7 @@ class WorkerScreen(FormScreen):
             self.set_feedback(message, tone="error")
         finally:
             button.disabled = False
-            button.label = "↻ 刷新模型"
+            button.label = "刷新模型"
 
     def draft(
         self, values: dict[str, str] | None = None, *, allow_blank_model: bool = False
@@ -636,15 +660,37 @@ class NodeScreen(FormScreen):
             required=("node_id", "label") if is_new else ("label",),
         )
 
+    def _downstream_ids(self) -> set[str]:
+        """找出当前节点的全部直接与间接下游节点，勾选它们作为上游必然形成回环。"""
+        if self.is_new:
+            return set()
+        children: dict[str, list[str]] = {n.id: [] for n in self.workflow.nodes}
+        for item in self.workflow.nodes:
+            if item.id == self.node.id:
+                continue
+            for dep in item.dependencies:
+                if dep in children:
+                    children[dep].append(item.id)
+        visited: set[str] = set()
+        queue = list(children.get(self.node.id, ()))
+        while queue:
+            curr = queue.pop(0)
+            if curr not in visited:
+                visited.add(curr)
+                queue.extend(children.get(curr, ()))
+        return visited
+
     def body(self) -> ComposeResult:
         yield from super().body()
         other_nodes = [n for n in self.workflow.nodes if n.id != self.node.id]
+        downstream = self._downstream_ids()
         yield Label("直接上游依赖 · Space 或点击多选（不选则为起始节点）")
         if other_nodes:
             yield SelectionList[str](
                 *[
                     (
-                        f"{n.id} · {n.label} (@{n.worker_id})",
+                        f"{n.id} · {n.label} (@{n.worker_id})"
+                        + (" · 下游节点（勾选将成环）" if n.id in downstream else ""),
                         n.id,
                         n.id in self.node.dependencies,
                     )
@@ -659,14 +705,16 @@ class NodeScreen(FormScreen):
                 markup=False,
             )
 
-    def validate(self, values: dict[str, str]) -> Node:
-        super().validate(values)
+    def _build_candidate(
+        self, values: dict[str, str], *, placeholder_label: bool = False
+    ) -> tuple[Node, Workflow]:
         node_id = values["node_id"].strip() if self.is_new else self.node.id
+        label = values["label"].strip() or ("_" if placeholder_label else "")
         deps_widgets = self.query("#field-deps-list")
         dependencies = list(deps_widgets.first(SelectionList).selected) if deps_widgets else []
         node = Node(
             node_id,
-            values["label"].strip(),
+            label,
             values["worker"],
             values["task"],
             dependencies,
@@ -676,6 +724,30 @@ class NodeScreen(FormScreen):
             candidate.nodes.append(node)
         else:
             candidate.nodes = [node if n.id == node.id else n for n in candidate.nodes]
+        return node, candidate
+
+    def _check_live_dag_conflict(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            _, candidate = self._build_candidate(self.values(), placeholder_label=True)
+            validate_workflow(candidate, self.worker_catalog)
+        except ValueError as exc:
+            self.set_feedback(f"{self.redact(str(exc))}（冲突已禁止保存）", tone="error")
+        else:
+            self.set_feedback("", tone="info")
+
+    @on(SelectionList.SelectedChanged, "#field-deps-list")
+    def deps_selection_changed(self) -> None:
+        self._check_live_dag_conflict()
+
+    @on(Input.Changed, "#field-node_id")
+    def node_id_changed(self) -> None:
+        self._check_live_dag_conflict()
+
+    def validate(self, values: dict[str, str]) -> Node:
+        super().validate(values)
+        node, candidate = self._build_candidate(values)
         validate_workflow(candidate, self.worker_catalog)
         return node
 
@@ -695,6 +767,7 @@ class FlowEditor(Dialog):
         self.is_new = is_new
         self.mode = "visual"
         self.selected_node_id = workflow.nodes[0].id if workflow.nodes else ""
+        self._last_preview_width = 0
         title = "新建工作流 · 可视化编排" if is_new else f"编辑工作流 · {workflow.name}"
         super().__init__(title, wide=True)
 
@@ -708,8 +781,8 @@ class FlowEditor(Dialog):
         yield TextArea(self.draft_workflow.task, id="field-task")
 
         with Horizontal(classes="mode-bar"):
-            yield Button("❖ 可视化编排", id="tab-visual", classes="mode-tab active")
-            yield Button("⌘ Mermaid 源码（高级）", id="tab-source", classes="mode-tab")
+            yield Button("可视化编排", id="tab-visual", classes="mode-tab active")
+            yield Button("Mermaid 源码（高级）", id="tab-source", classes="mode-tab")
 
         with Vertical(id="panel-visual"):
             yield Label("快捷模板 · 一键生成拓扑骨架（自动分配已有 Worker）")
@@ -722,8 +795,8 @@ class FlowEditor(Dialog):
             yield Label("节点与依赖编排 · 无需手写语法")
             with Horizontal(classes="action-row"):
                 yield Button("+ 添加节点", id="flow-add-node", classes="btn-primary")
-                yield Button("✎ 编辑选中节点", id="flow-edit-node", classes="btn-subtle")
-                yield Button("✕ 删除选中节点", id="flow-del-node", classes="btn-danger")
+                yield Button("编辑选中节点", id="flow-edit-node", classes="btn-subtle")
+                yield Button("删除选中节点", id="flow-del-node", classes="btn-danger")
 
             yield OptionList(id="flow-nodes", markup=False)
             yield Label("实时拓扑预览")
@@ -731,15 +804,55 @@ class FlowEditor(Dialog):
 
         with Vertical(id="panel-source"):
             yield Label('Mermaid 语法 · A["节点名称 @worker_id"]，A --> B')
-            source = (
-                to_mermaid(self.draft_workflow) if self.draft_workflow.nodes else "flowchart TD\n"
-            )
+            try:
+                source = (
+                    to_mermaid(self.draft_workflow)
+                    if self.draft_workflow.nodes
+                    else "flowchart TD\n"
+                )
+            except ValueError:
+                source = self.draft_workflow.source or "flowchart TD\n"
             yield TextArea(source, id="field-source", show_line_numbers=True)
 
     def on_mount(self) -> None:
         self.query_one("#panel-source").display = False
         self._refresh_visual()
+        self.call_after_refresh(self._refresh_preview_if_resized)
         self.query_one("#field-name", Input).focus()
+
+    def on_resize(self, event: events.Resize) -> None:
+        if self.is_mounted and self.mode == "visual":
+            self.call_after_refresh(self._refresh_preview_if_resized)
+
+    def _preview_width(self) -> int:
+        preview_box = self.query_one("#flow-preview", Static)
+        if preview_box.content_size.width > 0:
+            return preview_box.content_size.width
+        dialog_inner = min(112, int(self.app.size.width * 0.92)) - 11
+        return max(40, dialog_inner)
+
+    def _update_preview(self) -> None:
+        preview_box = self.query_one("#flow-preview", Static)
+        if self.draft_workflow.nodes:
+            width = self._preview_width()
+            self._last_preview_width = width
+            try:
+                validate_workflow(self.draft_workflow, self.worker_catalog)
+                preview = graph(
+                    self.draft_workflow, {}, self.selected_node_id, width, 0, interactive=False
+                )
+            except ValueError as exc:
+                preview = Text(f"拓扑冲突，无法显示与运行：{exc}", RED)
+                self.set_feedback(f"{self.app.redact(str(exc))}（冲突已禁止保存）", tone="error")
+        else:
+            self._last_preview_width = 0
+            preview = Text("暂无节点，请点击上方「+ 添加节点」或选择一键模板。", MUTED)
+        preview_box.update(preview)
+
+    def _refresh_preview_if_resized(self) -> None:
+        if self.is_mounted and self.mode == "visual" and self.draft_workflow.nodes:
+            if self._preview_width() != self._last_preview_width:
+                self._update_preview()
 
     def _sync_source_from_draft(self) -> None:
         source = to_mermaid(self.draft_workflow) if self.draft_workflow.nodes else "flowchart TD\n"
@@ -789,12 +902,7 @@ class FlowEditor(Dialog):
             listing.highlighted = next(
                 (i for i, n in enumerate(ordered) if n.id == self.selected_node_id), 0
             )
-            preview = graph(
-                self.draft_workflow, {}, self.selected_node_id, 78, 0, interactive=False
-            )
-        else:
-            preview = Text("暂无节点，请点击上方「+ 添加节点」或选择一键模板。", MUTED)
-        self.query_one("#flow-preview", Static).update(preview)
+        self._update_preview()
 
     def _switch_mode(self, target: str) -> None:
         if target == self.mode:
@@ -835,6 +943,22 @@ class FlowEditor(Dialog):
         event.stop()
         self._switch_mode("source")
 
+    @on(TextArea.Changed, "#field-source")
+    def source_changed(self, event: TextArea.Changed) -> None:
+        if not self.is_mounted or self.mode != "source":
+            return
+        try:
+            parse_workflow(
+                event.text_area.text,
+                self.worker_catalog,
+                workflow_id=self.draft_workflow.id,
+                name=self.query_one("#field-name", Input).value.strip() or self.draft_workflow.name,
+            )
+        except ValueError as exc:
+            self.set_feedback(f"{self.app.redact(str(exc))}（冲突已禁止保存）", tone="error")
+        else:
+            self.set_feedback("", tone="info")
+
     @on(Button.Pressed, "#tpl-single")
     @on(Button.Pressed, "#tpl-serial")
     @on(Button.Pressed, "#tpl-review")
@@ -857,10 +981,7 @@ class FlowEditor(Dialog):
     def node_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option and event.option.id:
             self.selected_node_id = event.option.id
-            preview = graph(
-                self.draft_workflow, {}, self.selected_node_id, 78, 0, interactive=False
-            )
-            self.query_one("#flow-preview", Static).update(preview)
+            self._update_preview()
 
     @on(OptionList.OptionSelected, "#flow-nodes")
     def node_double_activated(self, event: OptionList.OptionSelected) -> None:
@@ -1014,7 +1135,7 @@ class ModelPicker(PickerScreen):
         )
 
     def body(self) -> ComposeResult:
-        yield Button("↻ 刷新模型", id="refresh-models", classes="btn-primary")
+        yield Button("刷新模型", id="refresh-models", classes="btn-primary")
         yield from super().body()
 
     @on(Button.Pressed, "#refresh-models")
@@ -1037,4 +1158,4 @@ class ModelPicker(PickerScreen):
             self.set_feedback(self.worker.redact(str(exc)), tone="error")
         finally:
             button.disabled = False
-            button.label = "↻ 刷新模型"
+            button.label = "刷新模型"

@@ -37,6 +37,10 @@ Worker 的模型配置和 `/models` 列表都提供“刷新模型”按钮。Wo
 
 | 命令 | 操作 |
 | --- | --- |
+| `/hub` | 返回工作流与 Worker 选择页 |
+| `/chat`、`/chat <worker-id>` | 进入单 Worker 多轮对话 |
+| `/copy` | 复制单聊最后回答或工作流最终结果 |
+| `/clear (new)` | 在单聊模式下开启新对话，支持 `/clear` 或 `/new` 调用 |
 | `/worker` | 打开 Worker 列表 |
 | `/worker new`、`/worker <id>` | 配置独立接口、API Key、模型、附加参数、固定上下文和技能 |
 | `/models`、`/models <worker-id>` | 读取当前节点所引用的 Worker 或指定 Worker 的模型列表 |
@@ -48,7 +52,7 @@ Worker 的模型配置和 `/models` 列表都提供“刷新模型”按钮。Wo
 | `/node A` | 打开指定节点的配置 |
 | `/run`、`/run stop` | 执行或停止 |
 | `/view flow`、`/view run`、`/view result` | 切换编排、节点输出和结果视图 |
-| `/export` | 导出本次运行结果 Markdown |
+| `/export` | 导出本次运行结果或单聊记录 Markdown |
 
 普通文本更新当前工作流的总任务。编辑保存后，可通过 `/flow` 切换，重启后仍从 SQLite 加载。运行期间可查看节点输出，配置和切换在本次运行结束后进行。
 

@@ -10,6 +10,13 @@ Screen {
     link-style: none;
 }
 
+Static {
+    link-style: none;
+    link-style-hover: none;
+    link-background: transparent;
+    link-background-hover: transparent;
+}
+
 #masthead {
     width: 1fr;
     height: 1;
@@ -32,8 +39,10 @@ Screen {
     height: auto;
     padding: 0 2;
     margin: 0 0 1 0;
-    border: round #2d3545;
-    background: #141821;
+    border: round #263248;
+    border-title-color: #7aa2f7;
+    border-title-background: #121620;
+    background: #121620;
     text-wrap: nowrap;
     overflow-x: hidden;
 }
@@ -45,7 +54,9 @@ Screen {
     align-vertical: middle;
 }
 
-.hub-tab {
+Button.hub-tab,
+Button.hub-tab:focus,
+Button.hub-tab.-active {
     width: auto;
     min-width: 14;
     height: 3;
@@ -53,17 +64,29 @@ Screen {
     padding: 0 2;
     border: round #2d3545;
     background: #161a22;
+    background-tint: transparent;
+    tint: transparent;
     color: #7f8a9e;
+    text-style: none;
 }
 
-.hub-tab:hover {
-    background: #1e2430;
+Button.hub-tab:hover {
+    border: round #414d63;
+    background: #161a22;
+    background-tint: transparent;
+    tint: transparent;
     color: #dce3f0;
+    text-style: none;
 }
 
-.hub-tab.active {
+Button.hub-tab.active,
+Button.hub-tab.active:hover,
+Button.hub-tab.active:focus,
+Button.hub-tab.active.-active {
     border: round #7aa2f7;
-    background: #1d283d;
+    background: #161a22;
+    background-tint: transparent;
+    tint: transparent;
     color: #7aa2f7;
     text-style: bold;
 }
@@ -174,19 +197,19 @@ Pane > Static.content {
     overflow-x: hidden;
 }
 
-#map-pane Static {
-    link-style: none;
-    link-style-hover: none;
-}
-
 #map-pane {
     height: 13;
-    border: round #7aa2f7;
+    border: round #38496b;
     border-title-color: #7aa2f7;
 }
 
 #reading-pane {
     height: 1fr;
+}
+
+#reading-pane:focus-within {
+    border: round #7aa2f7;
+    border-title-color: #7aa2f7;
 }
 
 #sidebar {
@@ -198,6 +221,11 @@ Pane > Static.content {
     border-title-color: #7f8a9e;
     border-title-background: #161a22;
     background: #161a22;
+}
+
+#sidebar:focus-within {
+    border: round #7aa2f7;
+    border-title-color: #7aa2f7;
 }
 
 #sidebar-actions {
@@ -233,8 +261,12 @@ Pane > Static.content {
 #chat-pane {
     width: 1fr;
     height: 1fr;
-    border: round #7aa2f7;
+    border: round #38496b;
     border-title-color: #7aa2f7;
+}
+
+#chat-pane:focus-within {
+    border: round #7aa2f7;
 }
 
 /* ==================== 列表、命令浮层与底部 Composer ==================== */
@@ -250,6 +282,8 @@ OptionList, SelectionList {
     scrollbar-size: 1 1;
     scrollbar-background: #161a22;
     scrollbar-color: #343d4b;
+    scrollbar-color-hover: #56647a;
+    scrollbar-color-active: #7aa2f7;
 }
 
 OptionList:focus, SelectionList:focus {
@@ -266,8 +300,8 @@ OptionList > .option-list--option-hover {
 }
 
 OptionList > .option-list--option-highlighted {
-    background: #223552;
-    color: #7aa2f7;
+    background: #1f2e47;
+    color: #89b4fa;
     text-style: bold;
 }
 
@@ -403,8 +437,12 @@ Dialog {
     height: 1fr;
     min-height: 1;
     overflow-x: hidden;
+    overflow-y: auto;
     scrollbar-size: 1 1;
+    scrollbar-background: #161a22;
     scrollbar-color: #343d4b;
+    scrollbar-color-hover: #56647a;
+    scrollbar-color-active: #7aa2f7;
 }
 
 #dialog-fields Label {
@@ -465,7 +503,9 @@ Dialog {
     margin: 0 0 1 0;
 }
 
-Button {
+Button,
+Button:focus,
+Button.-active {
     height: 1;
     min-height: 1;
     min-width: 6;
@@ -473,11 +513,17 @@ Button {
     padding: 0 2;
     border: none;
     background: #222938;
+    background-tint: transparent;
+    tint: transparent;
     color: #dce3f0;
+    text-style: none;
 }
 
 Button:hover {
+    border: none;
     background: #2c364b;
+    background-tint: transparent;
+    tint: transparent;
 }
 
 .btn-primary {
@@ -518,6 +564,11 @@ Button:hover {
     background: #223552;
     color: #7aa2f7;
     text-style: bold;
+}
+
+#panel-visual, #panel-source {
+    width: 1fr;
+    height: auto;
 }
 
 #flow-nodes {

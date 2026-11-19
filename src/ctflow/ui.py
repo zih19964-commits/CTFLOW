@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import math
+import shutil
+import subprocess
+import sys
+import time
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.console import Group
 from rich.markdown import Markdown
+from rich.rule import Rule
 from rich.style import Style
 from rich.text import Text
 from rich.theme import Theme
@@ -19,6 +27,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
+from ctflow import __version__
 from ctflow.builtin_tools import BUILTIN_TOOL_CATALOG
 from ctflow.chat import (
     ChatSession,
@@ -27,7 +36,7 @@ from ctflow.chat import (
     run_chat_turn,
 )
 from ctflow.engine import Engine
-from ctflow.graph import to_mermaid
+from ctflow.graph import to_mermaid, validate_workflow
 from ctflow.models import Node, NodeRun, Run, Worker, Workflow, new_id, now, upstream_label
 from ctflow.provider import ModelClient
 from ctflow.rendering import (
@@ -37,7 +46,9 @@ from ctflow.rendering import (
     MUTED,
     ORANGE,
     RED,
+    SPLASH_FREEZE_AT,
     TEXT,
+    USER_TEXT,
     extract_tool_steps,
     fit,
     format_tool_steps_markdown,
@@ -91,6 +102,69 @@ def _link(label: str, action: str, color: str = BLUE, *, bold: bool = False) -> 
     return (label, Style(color=color, bold=bold, meta={"@click": f"app.{action}"}))
 
 
+def _copy_system_clipboard(text: str) -> None:
+    """向操作系统原生剪贴板同步写入文本，补充终端 OSC 52 在长文本或部分壳层下的限制。"""
+    if sys.platform == "win32":
+        cf_unicodetext = 13
+        gmem_moveable = 0x0002
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+        user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+
+        raw = text.encode("utf-16-le") + b"\x00\x00"
+        if not user32.OpenClipboard(None):
+            return
+        handle = None
+        try:
+            user32.EmptyClipboard()
+            handle = kernel32.GlobalAlloc(gmem_moveable, len(raw))
+            if not handle:
+                return
+            locked = kernel32.GlobalLock(handle)
+            if not locked:
+                kernel32.GlobalFree(handle)
+                return
+            try:
+                ctypes.memmove(locked, raw, len(raw))
+            finally:
+                kernel32.GlobalUnlock(handle)
+            if not user32.SetClipboardData(cf_unicodetext, handle):
+                kernel32.GlobalFree(handle)
+        finally:
+            user32.CloseClipboard()
+        return
+
+    for cmd in (
+        ["pbcopy"],
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode("utf-8"), timeout=1.5, check=False)
+            except OSError:
+                pass
+            return
+
+
+class HubOptionList(OptionList):
+    """Hub 选择页列表：Enter 直接进入，鼠标单击仅高亮切换预览（双击由 App 处理进入）。"""
+
+    BINDINGS = [Binding("enter", "activate_item", show=False, priority=True)]
+
+    def action_activate_item(self) -> None:
+        self.app._activate_hub_item()
+
+
 class Pane(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield Static(classes="content", markup=False)
@@ -115,6 +189,10 @@ class CommandInput(Input):
             event.stop()
             event.prevent_default()
             self.app.action_back_to_hub()
+        elif event.key in {"pageup", "pagedown"}:
+            event.stop()
+            event.prevent_default()
+            self.app.scroll_active_pane(up=event.key == "pageup")
 
     def action_suggest(self, step: int) -> None:
         self.app.move_suggestion(step)
@@ -126,6 +204,8 @@ class CommandInput(Input):
 COMMANDS = [
     ("/hub", "返回工作流与 Worker 选择页（快捷键 ←）"),
     ("/chat", "进入单 Worker 独立对话 · /chat <worker_id>"),
+    ("/copy", "复制最后回答或工作流最终结果"),
+    ("/clear (new)", "单聊模式下开启新对话"),
     ("/worker", "选择 Worker 配置"),
     ("/worker new", "新增 Worker"),
     ("/models", "刷新所选节点 Worker 的模型 · /models <worker_id>"),
@@ -140,9 +220,21 @@ COMMANDS = [
     ("/view flow", "编排视图"),
     ("/view run", "执行视图（含工具步骤）"),
     ("/view result", "结果汇总视图"),
-    ("/clear", "单聊模式下开启新对话"),
     ("/export", "导出运行结果或单聊记录"),
 ]
+
+
+def _match_command_choice(label: str, typed: str) -> str | None:
+    """根据命令展示标签与当前输入匹配实际可执行命令，支持 /clear (new) 双触发词。"""
+    if label == "/clear (new)":
+        if "/new".startswith(typed):
+            return "/new"
+        if "/clear new".startswith(typed) and typed.startswith("/clear "):
+            return "/clear new"
+        if "/clear".startswith(typed) or label.startswith(typed):
+            return "/clear"
+        return None
+    return label if label.startswith(typed) else None
 
 
 class CTFlowApp(App[None]):
@@ -192,12 +284,21 @@ class CTFlowApp(App[None]):
         self._stop_requested = False
         self._shutting_down = False
         self.frame = 0
-        self.matches: list[tuple[str, str]] = []
+        self.matches: list[tuple[str, str, str]] = []
+        self._suggestion_moved = False
         self.message = "输入目标保存总任务 · / 打开命令 · 空框按 ← 返回选择页"
         self.last_export: Path | None = None
         self._cards_key: tuple = ()
         self._reading_key: tuple = ()
         self._chat_key: tuple = ()
+        self._splash_start: float = 0.0
+        self._splash_frozen: bool = True
+        self._splash_counts: tuple[int, int, int] = (0, 0, 0)
+        self._splash_timer = None
+
+    @property
+    def _ui_ready(self) -> bool:
+        return self.is_mounted and not self._shutting_down and bool(self.screen_stack)
 
     @property
     def root(self):
@@ -209,13 +310,13 @@ class CTFlowApp(App[None]):
         with Vertical(id="hub-view"):
             yield Static(id="splash-banner", markup=False)
             with Horizontal(id="hub-toolbar"):
-                yield Button("❖ Workflows", id="hub-tab-workflows", classes="hub-tab active")
-                yield Button("◉ Workers", id="hub-tab-workers", classes="hub-tab")
-                yield Button("◷ Runs", id="hub-tab-runs", classes="hub-tab")
+                yield Button("Workflows", id="hub-tab-workflows", classes="hub-tab active")
+                yield Button("Workers", id="hub-tab-workers", classes="hub-tab")
+                yield Button("Runs", id="hub-tab-runs", classes="hub-tab")
                 yield Input(placeholder="按 / 筛选名称、ID 或模型…", id="hub-filter")
             with Horizontal(id="hub-body"):
                 with Vertical(id="hub-list-box"):
-                    yield OptionList(id="hub-list", markup=False)
+                    yield HubOptionList(id="hub-list", markup=False)
                 yield Pane(id="hub-preview", can_focus=False)
             yield Static(id="hub-footer", markup=False)
 
@@ -257,10 +358,19 @@ class CTFlowApp(App[None]):
         )
         for selector in ("#masthead", "#sidebar-actions", "#assembly-hint"):
             self.root.query_one(selector, Static).auto_links = False
+        for tab_btn in self.root.query(".hub-tab"):
+            if isinstance(tab_btn, Button):
+                tab_btn.active_effect_duration = 0
+        splash = self.root.query_one("#splash-banner", Static)
+        splash.border_title = f"CTflow v{__version__}"
         self.root.query_one("#map-pane", Pane).query_one(Static).auto_links = False
         self.root.query_one("#command-menu").display = False
         prompt = self.root.query_one("#prompt", Input)
         prompt.cursor_blink = False
+        if self.page == "hub" and not self.is_headless:
+            self._splash_start = time.monotonic()
+            self._splash_frozen = False
+            self._splash_timer = self.set_interval(0.04, self._tick_splash)
         self._apply_page_visibility()
         self.render_current()
         self.set_message(self.message)
@@ -283,7 +393,51 @@ class CTFlowApp(App[None]):
             self.frame += 1
             self.render_current()
 
+    def _freeze_splash(self) -> None:
+        self._splash_frozen = True
+        if self._splash_timer is not None:
+            self._splash_timer.stop()
+            self._splash_timer = None
+
+    def _tick_splash(self) -> None:
+        if not self._ui_ready or self.page != "hub" or self._splash_frozen:
+            return
+        self._update_splash_banner()
+
+    def _update_splash_banner(self) -> None:
+        if not self._ui_ready:
+            return
+        banner = self.root.query_one("#splash-banner", Static)
+        compact_splash = self.size.height < 30 or self.size.width < 82
+        inner_width = (
+            banner.content_size.width
+            if banner.content_size.width > 0
+            else max(60, self.size.width - 8)
+        )
+        if self._splash_frozen:
+            anim_time = math.inf
+        else:
+            elapsed_s = max(0.0, time.monotonic() - self._splash_start)
+            if elapsed_s >= SPLASH_FREEZE_AT:
+                self._freeze_splash()
+                anim_time = math.inf
+            else:
+                anim_time = elapsed_s
+        worker_cnt, workflow_cnt, run_cnt = self._splash_counts
+        banner.update(
+            render_splash(
+                worker_cnt,
+                workflow_cnt,
+                run_cnt,
+                compact=compact_splash,
+                anim_time=anim_time,
+                width=inner_width,
+            )
+        )
+
     def _apply_page_visibility(self) -> None:
+        if self.page != "hub":
+            self._freeze_splash()
         self.root.query_one("#hub-view").display = self.page == "hub"
         self.root.query_one("#workbench-view").display = self.page == "workbench"
         self.root.query_one("#chat-view").display = self.page == "chat"
@@ -292,7 +446,7 @@ class CTFlowApp(App[None]):
             self.root.query_one("#command-menu").display = False
 
     def render_current(self) -> None:
-        if not self.is_mounted:
+        if not self._ui_ready:
             return
         if self.page == "hub":
             self.render_hub()
@@ -301,9 +455,24 @@ class CTFlowApp(App[None]):
         else:
             self.render_workbench()
 
+    def scroll_active_pane(self, *, up: bool) -> None:
+        if not self._ui_ready:
+            return
+        selector = "#chat-pane" if self.page == "chat" else "#reading-pane"
+        pane = self.root.query_one(selector, Pane)
+        if up:
+            pane.scroll_page_up(animate=False)
+        else:
+            pane.scroll_page_down(animate=False)
+
+    def _write_clipboard(self, text: str) -> None:
+        self.copy_to_clipboard(text)
+        if not self.is_headless:
+            _copy_system_clipboard(text)
+
     def set_message(self, text: str, *, error: bool = False) -> None:
         self.message = self.redact(text)
-        if self.is_mounted:
+        if self._ui_ready:
             self.root.query_one("#input-meta", Static).update(
                 Text(self.message, RED if error else MUTED)
             )
@@ -415,13 +584,6 @@ class CTFlowApp(App[None]):
             return
         self.open_chat(worker_id)
 
-    def action_edit_chat_worker(self) -> None:
-        if self.chat_worker_id:
-            try:
-                self.open_worker(self.chat_worker_id)
-            except ValueError as exc:
-                self.set_message(str(exc), error=True)
-
     def action_edit_selected_worker(self) -> None:
         if self.workflow and self.selected_node:
             node = next((n for n in self.workflow.nodes if n.id == self.selected_node), None)
@@ -456,35 +618,38 @@ class CTFlowApp(App[None]):
             btn = self.root.query_one(f"#hub-tab-{name}", Button)
             btn.set_class(name == tab, "active")
         self.render_hub()
+        if self._ui_ready and not self.root.query_one("#hub-filter", Input).has_focus:
+            self.root.query_one("#hub-list", OptionList).focus()
 
     def _render_hub_footer(self, *, error: bool = False) -> None:
         hints = {
             "workflows": (
-                "↑↓ 浏览 · Enter/→ 进入工作台 · n 新建 · e 编辑 · r 运行 · c 复制 · d 删除 · / 筛选"
+                "↑↓/单击 预览 · 双击/Enter 进入 · n 新建 · e 编辑"
+                " · r 运行 · c 复制 · d 删除 · / 筛选"
             ),
             "workers": (
-                "↑↓ 浏览 · Enter/→ 开始单聊 · n 新建 · e 配置 · m 刷新模型 · d 删除 · / 筛选"
+                "↑↓/单击 预览 · 双击/Enter 单聊 · n 新建 · e 配置 · m 刷新模型 · d 删除 · / 筛选"
             ),
-            "runs": "↑↓ 浏览 · Enter/→ 回放历史运行 · 1/2/3 切标签 · / 筛选",
+            "runs": "↑↓/单击 预览 · 双击/Enter 回放 · 1/2/3 切标签 · / 筛选",
         }[self.hub_tab]
         footer = self.root.query_one("#hub-footer", Static)
         if error:
-            footer.update(Text(f"⚠ {self.message}", RED))
+            footer.update(Text(self.message, RED))
         else:
             footer.update(Text(hints, MUTED))
 
     def render_hub(self) -> None:
-        if not self.is_mounted:
+        if not self._ui_ready:
             return
         workers = self.store.list_workers()
         workflows = self.store.list_workflows()
         runs = self.store.list_runs(limit=30)
 
         head = Text()
-        head.append(" ◈ CTflow ", "bold " + ORANGE)
+        head.append(" CTflow ", "bold " + ORANGE)
         head.append(" 选择页 ", BLUE)
         head.append("  ·  ", LINE)
-        head.append("1 Workflows  2 Workers  3 Runs  ·  → 进入", MUTED)
+        head.append("1 Workflows  2 Workers  3 Runs  ·  双击或 → 进入", MUTED)
         if self.workflow:
             head.append("   ")
             head.append(
@@ -492,14 +657,12 @@ class CTFlowApp(App[None]):
             )
         self.root.query_one("#masthead", Static).update(head)
 
-        compact_splash = self.size.height < 30 or self.size.width < 92
-        self.root.query_one("#splash-banner", Static).update(
-            render_splash(len(workers), len(workflows), len(runs), compact=compact_splash)
-        )
+        self._splash_counts = (len(workers), len(workflows), len(runs))
+        self._update_splash_banner()
 
-        self.root.query_one("#hub-tab-workflows", Button).label = f"❖ Workflows ({len(workflows)})"
-        self.root.query_one("#hub-tab-workers", Button).label = f"◉ Workers ({len(workers)})"
-        self.root.query_one("#hub-tab-runs", Button).label = f"◷ Runs ({len(runs)})"
+        self.root.query_one("#hub-tab-workflows", Button).label = f"Workflows ({len(workflows)})"
+        self.root.query_one("#hub-tab-workers", Button).label = f"Workers ({len(workers)})"
+        self.root.query_one("#hub-tab-runs", Button).label = f"Runs ({len(runs)})"
 
         query = self.hub_query.strip().casefold()
         listing = self.root.query_one("#hub-list", OptionList)
@@ -508,7 +671,7 @@ class CTFlowApp(App[None]):
         list_box = self.root.query_one("#hub-list-box")
 
         if self.hub_tab == "workflows":
-            list_box.border_title = "工作流列表 · Enter / → 加载"
+            list_box.border_title = "工作流列表 · 单击预览 / 双击或 Enter 加载"
             latest_by_flow: dict[str, Run] = {}
             for item in runs:
                 latest_by_flow.setdefault(item.workflow.id, item)
@@ -519,7 +682,7 @@ class CTFlowApp(App[None]):
                 is_current = self.workflow is not None and wf.id == self.workflow.id
                 last_run = latest_by_flow.get(wf.id)
                 row = Text()
-                row.append("★ " if is_current else "❖ ", ORANGE if is_current else BLUE)
+                row.append("▸ " if is_current else "  ", ORANGE if is_current else MUTED)
                 row.append(fit(wf.name, 26), "bold " + TEXT if is_current else TEXT)
                 row.append(f"  ({len(wf.nodes)} 节点)\n", MUTED)
                 row.append(f"  {fit(workflow_summary(wf), 34)}", BLUE)
@@ -528,7 +691,7 @@ class CTFlowApp(App[None]):
                     row.append_text(status_text(last_run.status))
                 listing.add_option(Option(row, id=wf.id))
         elif self.hub_tab == "workers":
-            list_box.border_title = "Worker 角色库 · Enter / → 独立对话"
+            list_box.border_title = "Worker 角色库 · 单击预览 / 双击或 Enter 对话"
             for wk in workers:
                 haystack = f"{wk.id} {wk.name} {wk.model} {wk.base_url} {wk.protocol}".casefold()
                 if query and query not in haystack:
@@ -545,7 +708,7 @@ class CTFlowApp(App[None]):
                 row.append(f"  {model_str} · {host_str}{extra_info}", MUTED)
                 listing.add_option(Option(row, id=wk.id))
         else:
-            list_box.border_title = "历史运行 · Enter / → 回放"
+            list_box.border_title = "历史运行 · 单击预览 / 双击或 Enter 回放"
             for item in runs:
                 haystack = f"{item.id} {item.workflow.name} {item.task} {item.status}".casefold()
                 if query and query not in haystack:
@@ -577,6 +740,8 @@ class CTFlowApp(App[None]):
         self._render_hub_footer()
 
     def _render_hub_preview(self) -> None:
+        if not self._ui_ready:
+            return
         preview = self.root.query_one("#hub-preview", Pane)
         key = self._hub_selected_key()
         if key is None:
@@ -602,7 +767,10 @@ class CTFlowApp(App[None]):
             doc.append("总任务：", BLUE)
             doc.append((wf.task or "未填写总任务") + "\n\n", TEXT)
             doc.append("拓扑结构\n", BLUE)
-            doc.append_text(graph(wf, {}, "", width, 0, interactive=False))
+            try:
+                doc.append_text(graph(wf, {}, "", width, 0, interactive=False))
+            except ValueError as exc:
+                doc.append(f"拓扑冲突，无法显示与运行：{exc}", RED)
             doc.append("\n\n节点装配清单\n", BLUE)
             for node in wf.nodes:
                 deps = ", ".join(node.dependencies) if node.dependencies else "起点"
@@ -701,7 +869,15 @@ class CTFlowApp(App[None]):
     @on(OptionList.OptionSelected, "#hub-list")
     def hub_list_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
-        self._activate_hub_item(event.option.id)
+        self._render_hub_preview()
+
+    @on(events.Click, "#hub-list")
+    def double_click_hub_item(self, event: events.Click) -> None:
+        if event.button == 1 and event.chain == 2:
+            index = event.style.meta.get("option")
+            if index is not None:
+                listing = self.root.query_one("#hub-list", OptionList)
+                self._activate_hub_item(listing.get_option_at_index(index).id)
 
     def _activate_hub_item(self, key: str | None = None) -> None:
         selected = key or self._hub_selected_key()
@@ -896,6 +1072,8 @@ class CTFlowApp(App[None]):
     # ==================== 工作流与 Worker 编排管理 ====================
     def save_workflow(self, workflow: Workflow, *, switch_to_workbench: bool = True) -> None:
         self.require_editable()
+        workers = {w.id: w for w in self.store.list_workers()}
+        validate_workflow(workflow, workers)
         workflow.source = to_mermaid(workflow)
         self.store.save_workflow(workflow)
         self.workflow, self.view_run, self.view_name = workflow, None, "flow"
@@ -988,7 +1166,7 @@ class CTFlowApp(App[None]):
             PickerScreen(
                 "工作流 · 选择并加载",
                 [
-                    (w.id, Text(f"❖ {w.name}\n  {workflow_summary(w)} · {w.id}", BLUE))
+                    (w.id, Text(f"{w.name}\n  {workflow_summary(w)} · {w.id}", BLUE))
                     for w in self.store.list_workflows()
                 ],
                 "/flow new 可视化新建 · /flow edit 编辑 · /flow save 名称 另存",
@@ -1013,7 +1191,10 @@ class CTFlowApp(App[None]):
         prompt.placeholder = (
             f"向 @{worker.id} ({worker.name}) 发消息，或输入 /（空框按 ← 返回选择页）"
         )
-        self.set_message(f"单 Worker 对话 · @{worker.id} · /clear 清空 · /worker 配置 · ← 返回")
+        self.set_message(
+            f"单 Worker 对话 · @{worker.id} · /copy 复制 · /clear(new) 新对话"
+            " · /worker 配置 · ← 返回"
+        )
         self.render_chat()
         prompt.focus()
 
@@ -1067,7 +1248,7 @@ class CTFlowApp(App[None]):
             self.render_chat()
 
     def render_chat(self) -> None:
-        if not self.is_mounted or not self.chat_worker_id:
+        if not self._ui_ready or not self.chat_worker_id:
             return
         try:
             worker = self.store.get_worker(self.chat_worker_id)
@@ -1080,14 +1261,10 @@ class CTFlowApp(App[None]):
         head = Text()
         head.append(*_link(" ‹ 列表 ", "back_to_hub()", ORANGE, bold=True))
         head.append(" │ ", LINE)
-        head.append(f"💬 @{worker.id} · {worker.name}", "bold " + TEXT)
+        head.append(f"@{worker.id} · {worker.name}", "bold " + TEXT)
         head.append(f"  [{fit(worker.model, 24)} · {worker.protocol}]", BLUE)
-        head.append("   ")
-        head.append(*_link("[配置]", "edit_chat_worker()", MUTED))
-        head.append(" ")
-        head.append(*_link("[新对话]", "clear_chat()", MUTED))
         if self.workflow:
-            head.append(" ")
+            head.append("   ")
             head.append(*_link("[工作台]", "open_workbench()", GREEN))
         cost_text = money(usage.cost, self.settings.currency)
         head.append(
@@ -1124,7 +1301,7 @@ class CTFlowApp(App[None]):
 
         if not session.turns:
             intro = Text()
-            intro.append(f"◉ @{worker.id} · {worker.name}\n", "bold " + BLUE)
+            intro.append(f"@{worker.id} · {worker.name}\n", "bold " + BLUE)
             host = upstream_label(worker.base_url)
             intro.append(
                 f"模型：{worker.model}  ·  协议：{worker.protocol}  ·  上游：{host}\n",
@@ -1143,28 +1320,42 @@ class CTFlowApp(App[None]):
             pane.show_content(intro)
             return
 
-        sections: list[str] = []
+        # 提问与回复冷暖分色：用户采用暖橙/暖杏，Worker 采用科技蓝/冷白 Markdown，轮间柔和分隔。
+        blocks: list[object] = []
         for idx, turn in enumerate(session.turns, start=1):
-            sections.append(f"### 你 · 第 {idx} 轮\n\n{turn.user}")
-            tool_md = format_tool_steps_markdown(turn.tool_steps)
-            status_badge = {
-                "running": f"◉ 生成中{'.' * (self.frame % 4 + 1)}",
-                "success": f"✓ {turn.usage.total_tokens} tok",
-                "failed": "✕ 失败",
-                "stopped": "■ 已停止",
-            }.get(turn.status, turn.status)
-            body_parts = [f"### @{worker.id} · {worker.name}（{status_badge}）"]
-            if tool_md:
-                body_parts.append(tool_md)
-            if turn.assistant:
-                body_parts.append(turn.assistant)
-            elif turn.status == "running":
-                body_parts.append("等待模型输出…")
-            if turn.error:
-                body_parts.append(f"**错误**：{turn.error}")
-            sections.append("\n\n".join(body_parts))
+            if idx > 1:
+                blocks.extend([Text(""), Rule(style="#262d3c"), Text("")])
+            user_header = Text(f"▸ 你 · 第 {idx} 轮", "bold " + ORANGE)
+            user_body = Text(turn.user, USER_TEXT)
+            blocks.extend([user_header, Text(""), user_body, Text("")])
 
-        pane.show_content(Markdown("\n\n---\n\n".join(sections)), follow=self.chat_busy)
+            badge_text, badge_color = {
+                "running": (f"● 生成中{'.' * (self.frame % 4 + 1)}", BLUE),
+                "success": (f"✓ {turn.usage.total_tokens} tok", GREEN),
+                "failed": ("× 失败", RED),
+                "stopped": ("! 已停止", ORANGE),
+            }.get(turn.status, (turn.status, MUTED))
+            assistant_header = Text()
+            assistant_header.append(f"@{worker.id} · {worker.name}", "bold " + BLUE)
+            assistant_header.append(f"  ({badge_text})", badge_color)
+            blocks.extend([assistant_header, Text("")])
+
+            md_parts: list[str] = []
+            tool_md = format_tool_steps_markdown(turn.tool_steps)
+            if tool_md:
+                md_parts.append(tool_md)
+            if turn.assistant:
+                md_parts.append(turn.assistant)
+            if md_parts:
+                blocks.append(Markdown("\n\n".join(md_parts)))
+            elif turn.status == "running":
+                blocks.append(Text("等待模型输出…", MUTED))
+            if turn.error:
+                if md_parts:
+                    blocks.append(Text(""))
+                blocks.append(Text(f"错误：{turn.error}", RED))
+
+        pane.show_content(Group(*blocks), follow=self.chat_busy)
 
     # ==================== 工作流执行引擎交互 ====================
     async def action_run(self) -> None:
@@ -1269,6 +1460,7 @@ class CTFlowApp(App[None]):
 
     async def on_unmount(self) -> None:
         self._shutting_down = True
+        self._freeze_splash()
         self.engine.stop()
         tasks = [t for t in (self._run_task, self._model_task, self._chat_task) if t is not None]
         for task in tasks:
@@ -1340,11 +1532,17 @@ class CTFlowApp(App[None]):
                             ),
                             lambda key: self.open_chat(key) if key else None,
                         )
-            elif command == "/clear":
+            elif command in {"/clear", "/new"}:
+                if (command == "/clear" and arguments not in {"", "new"}) or (
+                    command == "/new" and arguments
+                ):
+                    raise ValueError("用法：/clear 或 /new")
                 if self.page == "chat":
                     self.action_clear_chat()
                 else:
-                    raise ValueError("/clear 仅用于单 Worker 对话模式")
+                    raise ValueError("/clear (new) 仅用于单 Worker 对话模式")
+            elif command == "/copy":
+                self.copy_latest_output(arguments)
             elif command == "/run":
                 if arguments == "stop":
                     self.action_stop()
@@ -1445,6 +1643,58 @@ class CTFlowApp(App[None]):
         except (ValueError, OSError, RuntimeError) as exc:
             self.set_message(str(exc), error=True)
 
+    def copy_latest_output(self, target_node: str = "") -> None:
+        """通用快捷复制：单聊模式复制最近一轮回答，工作台模式复制工作流最终结果或指定节点。"""
+        if self.page == "chat":
+            if target_node:
+                raise ValueError("单聊模式下直接输入 /copy 即可复制最后回答")
+            if not self.chat_session or not self.chat_session.turns:
+                raise ValueError("当前对话还没有可复制的回答")
+            for idx in range(len(self.chat_session.turns), 0, -1):
+                answer = self.chat_session.turns[idx - 1].assistant.strip()
+                if answer:
+                    clean = self.redact(answer)
+                    self._write_clipboard(clean)
+                    self.set_message(
+                        f"已复制 @{self.chat_session.worker_id} 第 {idx} 轮回答"
+                        f"（{len(clean)} 字符）"
+                    )
+                    return
+            raise ValueError("当前对话还没有可复制的回答")
+
+        run = self.view_run
+        if run is None:
+            raise ValueError("当前工作流没有运行结果，请先 /run")
+        if target_node:
+            if target_node not in run.nodes:
+                raise ValueError(f"找不到节点：{target_node}")
+            node_out = run.nodes[target_node].output.strip()
+            if not node_out:
+                raise ValueError(f"节点 {target_node} 尚无输出可复制")
+            clean = self.redact(node_out)
+            self._write_clipboard(clean)
+            self.set_message(f"已复制节点 {target_node} 结果（{len(clean)} 字符）")
+            return
+
+        parents = {p for n in run.workflow.nodes for p in n.dependencies}
+        terminals = [n for n in run.workflow.nodes if n.id not in parents]
+        ready = [
+            (n, run.nodes[n.id].output.strip())
+            for n in terminals
+            if n.id in run.nodes and run.nodes[n.id].output.strip()
+        ]
+        if not ready:
+            raise ValueError("当前工作流尚无最终结果可复制")
+        raw = (
+            ready[0][1]
+            if len(ready) == 1
+            else "\n\n".join(f"## {n.label}\n\n{out}" for n, out in ready)
+        )
+        clean = self.redact(raw)
+        self._write_clipboard(clean)
+        target_label = ready[0][0].label if len(ready) == 1 else f"{len(ready)} 个终点节点"
+        self.set_message(f"已复制最终结果 · {target_label}（{len(clean)} 字符）")
+
     def export_result(self) -> None:
         run = self.view_run
         if run is None:
@@ -1467,6 +1717,7 @@ class CTFlowApp(App[None]):
 
     @on(Input.Changed, "#prompt")
     def prompt_changed(self, event: Input.Changed) -> None:
+        self._suggestion_moved = False
         text = event.value.strip()
         choices = list(COMMANDS)
         if text.startswith("/worker "):
@@ -1477,13 +1728,18 @@ class CTFlowApp(App[None]):
             choices.extend((f"/flow {w.id}", w.name) for w in self.store.list_workflows())
         if text.startswith("/node ") and self.workflow:
             choices.extend((f"/node {n.id}", n.label) for n in self.workflow.nodes)
-        self.matches = (
-            [item for item in choices if item[0].startswith(text)] if text.startswith("/") else []
-        )
+        matched: list[tuple[str, str, str]] = []
+        if text.startswith("/"):
+            for label, hint in choices:
+                exec_cmd = _match_command_choice(label, text)
+                if exec_cmd is not None:
+                    matched.append((exec_cmd, label, hint))
+        self.matches = matched
         menu = self.root.query_one("#command-menu", OptionList)
         menu.clear_options()
         menu.add_options(
-            Option(Text.assemble((cmd, BLUE), (f"  {hint}", MUTED))) for cmd, hint in self.matches
+            Option(Text.assemble((label, BLUE), (f"  {hint}", MUTED)))
+            for _, label, hint in self.matches
         )
         menu.highlighted = 0 if self.matches else None
         menu.display = bool(self.matches)
@@ -1491,6 +1747,7 @@ class CTFlowApp(App[None]):
     def move_suggestion(self, step: int) -> None:
         menu = self.root.query_one("#command-menu", OptionList)
         if self.matches:
+            self._suggestion_moved = True
             menu.highlighted = ((menu.highlighted or 0) + step) % len(self.matches)
             menu.scroll_to_highlight()
 
@@ -1512,9 +1769,10 @@ class CTFlowApp(App[None]):
     async def submit(self, event: Input.Submitted) -> None:
         event.stop()
         text = event.value
-        if text.strip() == "/" and self.matches:
+        if (text.strip() == "/" or self._suggestion_moved) and self.matches:
             menu = self.root.query_one("#command-menu", OptionList)
             text = self.matches[menu.highlighted or 0][0]
+        self._suggestion_moved = False
         event.input.value = ""
         await self.execute_command(text)
 
@@ -1556,7 +1814,7 @@ class CTFlowApp(App[None]):
 
     # ==================== Workflow 工作台渲染 ====================
     def render_workbench(self) -> None:
-        if not self.is_mounted:
+        if not self._ui_ready:
             return
         run = self.view_run
         workflow = run.workflow if run and self.view_name != "flow" else self.workflow
@@ -1566,7 +1824,7 @@ class CTFlowApp(App[None]):
         head = Text()
         head.append(*_link(" ‹ 列表 ", "back_to_hub()", ORANGE, bold=True))
         head.append(" │ ", LINE)
-        flow_title = f"❖ {fit(workflow.name, 24) if workflow else '新工作台'} ▾"
+        flow_title = f"{fit(workflow.name, 24) if workflow else '新工作台'} ▾"
         head.append(*_link(flow_title, "quick_flow_picker()", TEXT, bold=True))
         head.append("  ")
         for key, title in (("flow", "编排"), ("run", "执行"), ("result", "结果")):
@@ -1580,11 +1838,10 @@ class CTFlowApp(App[None]):
                 )
             )
             head.append(" ")
-        head.append(*_link("[单聊]", "open_chat_current()", GREEN))
         if run:
             done_count = sum(1 for item in run.nodes.values() if item.status == "success")
             head.append(
-                f"  ·  {run.status} {done_count}/{len(run.nodes)} · "
+                f" ·  {run.status} {done_count}/{len(run.nodes)} · "
                 f"{run.usage.total_tokens} tok · {elapsed(run)}",
                 BLUE,
             )
@@ -1599,17 +1856,19 @@ class CTFlowApp(App[None]):
             if map_pane.content_size.width > 0
             else max(20, self.size.width - sidebar_reserved)
         )
-        drawing = (
-            graph(
-                workflow,
-                states,
-                self.selected_node,
-                max(20, canvas_width),
-                self.frame,
-            )
-            if workflow and workflow.nodes
-            else Text("/worker new 配置 Worker → /flow new 可视化创建工作流", MUTED)
-        )
+        if workflow and workflow.nodes:
+            try:
+                drawing = graph(
+                    workflow,
+                    states,
+                    self.selected_node,
+                    max(20, canvas_width),
+                    self.frame,
+                )
+            except ValueError as exc:
+                drawing = Text(f"拓扑冲突，无法显示与运行：{exc}", RED)
+        else:
+            drawing = Text("/worker new 配置 Worker → /flow new 可视化创建工作流", MUTED)
         # 多路并行时给画布足够行数，同时保留正文与底部输入区。
         map_pane.styles.height = (
             max(13, min(drawing.plain.count("\n") + 3, self.size.height - 13))
@@ -1623,12 +1882,12 @@ class CTFlowApp(App[None]):
         actions_line = Text()
         actions_line.append(*_link("+节点", "add_node_quick()", BLUE))
         actions_line.append(" · ", LINE)
-        actions_line.append(*_link("✎编排", "edit_flow_quick()", TEXT))
+        actions_line.append(*_link("编排", "edit_flow_quick()", TEXT))
         actions_line.append(" · ", LINE)
         if self.busy:
-            actions_line.append(*_link("■停止", "toggle_run()", RED, bold=True))
+            actions_line.append(*_link("停止", "toggle_run()", RED, bold=True))
         else:
-            actions_line.append(*_link("▶运行", "toggle_run()", GREEN, bold=True))
+            actions_line.append(*_link("→运行", "toggle_run()", GREEN, bold=True))
         self.root.query_one("#sidebar-actions", Static).update(actions_line)
 
         key = (
@@ -1675,16 +1934,16 @@ class CTFlowApp(App[None]):
         worker = workers.get(selected.worker_id) if selected else None
         if worker:
             hint_doc = Text()
-            hint_doc.append(f"@{worker.id} · {worker.name}\n", TEXT)
+            hint_doc.append(f"@{worker.id} · {worker.name}\n", "bold " + TEXT)
             hint_doc.append(f"{fit(worker.model, 28)} · {worker.protocol}\n", BLUE)
             tool_cnt = len(worker.builtin_tools) + len(worker.mcp_servers)
             hint_doc.append(
                 f"工具 {tool_cnt} · 技能 {len(worker.skills)}\n",
                 GREEN if tool_cnt else MUTED,
             )
-            hint_doc.append(*_link("⚙ 配置 Worker", "edit_selected_worker()", BLUE))
+            hint_doc.append(*_link("[配置 Worker]", "edit_selected_worker()", BLUE))
             hint_doc.append("  ", MUTED)
-            hint_doc.append(*_link("💬 单聊", "open_chat_current()", GREEN))
+            hint_doc.append(*_link("[单聊]", "open_chat_current()", GREEN))
             self.root.query_one("#assembly-hint", Static).update(hint_doc)
         else:
             self.root.query_one("#assembly-hint", Static).update(
@@ -1755,5 +2014,5 @@ class CTFlowApp(App[None]):
                     parts.append(f"**错误**：{state.error}")
                 content = Markdown("\n\n".join(parts))
             else:
-                content = Text("当前工作流还没有运行结果 · 输入 /run 或点击右侧 ▶运行", MUTED)
+                content = Text("当前工作流还没有运行结果 · 输入 /run 或点击右侧 →运行", MUTED)
             reading.show_content(content, follow=self.busy)

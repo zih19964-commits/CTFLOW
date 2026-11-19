@@ -1265,3 +1265,391 @@ async def test_rounded_canvas_and_multi_size_hub_layouts(workbench, size):
         if size[0] >= 100:
             drawing = graph(workflow, {}, "A", 80, 0).plain
             assert "╭" in drawing and "╰" in drawing and "┌" not in drawing
+
+
+async def test_hub_tab_no_white_flash_and_worker_single_vs_double_click(workbench):
+    """验证 Hub 标签切换无中间底色跳变，且 Worker 列表单击预览、双击才进入。"""
+    store, settings, workflow = workbench
+    app = CTFlowApp(store, settings, workflow, start_in_hub=True)
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        workers_btn = app.root.query_one("#hub-tab-workers", Button)
+        base_bg = workers_btn.styles.background
+        assert workers_btn.active_effect_duration == 0
+        assert workers_btn.styles.background_tint.a == 0
+
+        # 点击切换到 Workers 标签，背景色与 tint 保持完全恒定，焦点回到列表
+        assert await pilot.click("#hub-tab-workers")
+        await pilot.pause()
+        assert app.hub_tab == "workers"
+        assert workers_btn.styles.background == base_bg
+        assert workers_btn.styles.background_tint.a == 0
+        assert workers_btn.styles.tint.a == 0
+        workers_btn.add_class("-active")
+        assert workers_btn.styles.background == base_bg
+        assert workers_btn.styles.tint.a == 0
+        workers_btn.remove_class("-active")
+
+        listing = app.root.query_one("#hub-list", OptionList)
+        assert listing.has_focus
+        second_id = listing.get_option_at_index(1).id
+
+        # 鼠标单击第二项（每项 2 行高，offset y=2 命中第二项）：仅切换右侧详情预览，不进入单聊
+        assert await pilot.click("#hub-list", offset=(4, 2))
+        await pilot.pause()
+        assert app.page == "hub"
+        assert listing.highlighted == 1
+        preview_text = str(app.root.query_one("#hub-preview Static", Static).render())
+        assert f"@{second_id}" in preview_text
+
+        # 鼠标双击第二项：进入对应 Worker 单聊
+        assert await pilot.click("#hub-list", offset=(4, 2), times=2)
+        await pilot.pause()
+        assert app.page == "chat"
+        assert app.chat_worker_id == second_id
+
+
+async def test_no_link_underlines_sidebar_labels_dedup_chat_and_no_emojis(workbench):
+    """验证所有链接无下划线、侧栏操作文案、单聊按钮去重、单聊顶栏精简及跨平台无表情符号。"""
+    store, settings, workflow = workbench
+    banned_icons = set("💬⚙✎❖⌘◷⚠▶★◈◌◎◉⊘■↻")
+    app = CTFlowApp(store, settings, workflow)
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        for selector in ("#masthead", "#sidebar-actions", "#assembly-hint", "#map-pane Static"):
+            widget = app.root.query_one(selector, Static)
+            assert not widget.styles.link_style.underline
+            assert not widget.styles.link_style_hover.underline
+
+        masthead_text = str(app.root.query_one("#masthead", Static).render())
+        sidebar_actions_text = str(app.root.query_one("#sidebar-actions", Static).render())
+        hint_text = str(app.root.query_one("#assembly-hint", Static).render())
+
+        assert "[单聊]" not in masthead_text
+        assert "[单聊]" in hint_text
+        assert "[配置 Worker]" in hint_text
+        assert "+节点 · 编排 · →运行" in sidebar_actions_text
+        assert not (banned_icons & set(app.export_screenshot()))
+
+        # 进入单聊模式验证顶栏已移除 [配置] 与 [新对话]
+        await command(pilot, app, "/chat writer")
+        chat_head_text = str(app.root.query_one("#masthead", Static).render())
+        assert "[配置]" not in chat_head_text
+        assert "[新对话]" not in chat_head_text
+        assert "[工作台]" in chat_head_text
+        assert not (banned_icons & set(app.export_screenshot()))
+
+
+async def test_chat_color_distinction_new_alias_and_universal_copy_command(workbench):
+    """验证单聊问答颜色区分、/clear (new) 双触发词，以及单聊和工作流通用的 /copy 命令。"""
+    from rich.console import Group
+    from rich.markdown import Markdown
+
+    from ctflow.rendering import BLUE, ORANGE, USER_TEXT
+
+    store, settings, workflow = workbench
+
+    class TurnClient:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def stream(self, model, messages, on_text, tools=None):
+            self.turn += 1
+            text = f"第{self.turn}轮回复内容 · 附带密钥 test-writer-secret"
+            on_text(text)
+            return Reply(content=text, usage=Usage(8, 4, 0.001), status="completed")
+
+    app = CTFlowApp(store, settings, workflow, client=TurnClient())
+    async with app.run_test(size=(120, 36)) as pilot:
+        await command(pilot, app, "/chat writer")
+        await command(pilot, app, "第一轮我的提问")
+        await asyncio.wait_for(app._chat_task, 3)
+        await command(pilot, app, "第二轮我的追问")
+        await asyncio.wait_for(app._chat_task, 3)
+        await pilot.pause()
+
+        # 验证提问与回复采用不同颜色组件渲染
+        visual = app.root.query_one("#chat-pane Static", Static).render()
+        rendered = getattr(visual, "_renderable", visual)
+        assert isinstance(rendered, Group)
+        items = list(rendered.renderables)
+        user_headers = [x for x in items if hasattr(x, "plain") and "你 · 第 1 轮" in x.plain]
+        user_bodies = [x for x in items if hasattr(x, "plain") and x.plain == "第一轮我的提问"]
+        ai_headers = [x for x in items if hasattr(x, "plain") and "@writer · 写作者" in x.plain]
+        md_blocks = [x for x in items if isinstance(x, Markdown)]
+        assert user_headers and ORANGE in str(user_headers[0].style)
+        assert user_bodies and USER_TEXT in str(user_bodies[0].style)
+        assert ai_headers and BLUE in str(ai_headers[0].spans[0].style)
+        assert len(md_blocks) == 2
+
+        # 单聊模式下 /copy 复制最后一轮回答，并自动脱敏密钥
+        await command(pilot, app, "/copy")
+        assert "第2轮回复内容" in app.clipboard
+        assert "test-writer-secret" not in app.clipboard
+        assert "第 2 轮回答" in app.message
+
+        # 验证命令提示展示 /clear (new)，且可用 /new 调用开启新对话
+        prompt = app.root.query_one("#prompt", Input)
+        prompt.value = "/ne"
+        await pilot.pause()
+        assert any(label == "/clear (new)" and cmd == "/new" for cmd, label, _ in app.matches)
+        await pilot.press("tab")
+        assert prompt.value == "/new"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.chat_session.turns == []
+
+        # 切换到工作台验证通用 /copy 复制工作流最终汇合节点结果
+        await command(pilot, app, "/hub")
+        await pilot.press("1", "enter")
+        await pilot.pause()
+        assert app.page == "workbench"
+        await command(pilot, app, "/copy")
+        assert "没有运行结果" in app.message
+
+        await app.action_run()
+        await asyncio.wait_for(app._run_task, 3)
+        await pilot.pause()
+        await command(pilot, app, "/copy")
+        # 节点 B 是终点节点（第 4 次模型调用），复制的是终点节点最终结果且脱敏
+        assert "第4轮回复内容" in app.clipboard
+        assert "第3轮回复内容" not in app.clipboard
+        assert "test-writer-secret" not in app.clipboard
+        assert "已复制最终结果" in app.message
+
+
+def test_3d_splash_logo_rendering():
+    """验证仪表盘双栏选择页横幅与开场动画：橙 CT + 蓝 FLOW 分块滑落咬合、能量轨双闪、右侧快捷栏。"""
+    import math
+
+    from rich.cells import cell_len
+
+    from ctflow.rendering import _SOLID_CHARS, _hex_to_rgb, _render_logo_row, render_splash
+
+    # 1. 入场第 0 秒至终态：等高 9 行隐形占位，每行终端单元格宽度严格一致，不跳高不抖动
+    frame_start = render_splash(5, 3, 2, anim_time=0.0, width=116)
+    frame_final = render_splash(5, 3, 2, anim_time=math.inf, width=116)
+    assert frame_start.plain.count("\n") == frame_final.plain.count("\n") == 8
+    assert "╔" not in frame_start.plain
+    final_lines = frame_final.plain.splitlines()
+    assert len({cell_len(line) for line in final_lines}) == 1
+    assert all("│" in line for line in final_lines)
+    assert "快速开始" in frame_final.plain and "常用命令" in frame_final.plain
+
+    # 2. 阶段 1（t=0.30s）：左侧 CT 模块正从顶部滑落咬合，右侧 FLOW 尚未入场
+    logo_row_ct = _render_logo_row(0, anim_time=0.30, animated=True)
+    assert any(ch != " " for ch in logo_row_ct.plain[:18])
+    assert logo_row_ct.plain[20:].strip() == ""
+
+    # 3. 阶段 2（t=0.85s）与阶段 3（t=1.16s 脉冲双闪 / t=1.52s 定影高光）：FLOW 级联落位并触发闪光
+    logo_row_flow = _render_logo_row(0, anim_time=0.85, animated=True)
+    assert "█" in logo_row_flow.plain[20:]
+    frame_flash = render_splash(5, 3, 2, anim_time=1.16, width=116)
+    assert "━" * 20 in frame_flash.plain
+    logo_strobe = _render_logo_row(0, anim_time=1.52, animated=True)
+    logo_final_row0 = _render_logo_row(0, anim_time=math.inf, animated=False)
+    assert logo_strobe != logo_final_row0
+
+    # 4. 定格终态：保留 CT 明快暖橙色系 + FLOW 清澈亮蓝色系，底座收束为双色短轨
+    assert "━━━━ · ━━━━" in frame_final.plain
+    ct_rgb = [
+        _hex_to_rgb(str(sp.style))
+        for sp in logo_final_row0.spans
+        if str(sp.style).startswith("#") and sp.start < 18
+    ]
+    flow_rgb = [
+        _hex_to_rgb(str(sp.style))
+        for sp in logo_final_row0.spans
+        if str(sp.style).startswith("#") and 20 <= sp.start < 58
+    ]
+    ct_solid_rgb = [
+        _hex_to_rgb(str(sp.style))
+        for sp in logo_final_row0.spans
+        if str(sp.style).startswith("#")
+        and sp.start < 18
+        and any(ch in _SOLID_CHARS for ch in logo_final_row0.plain[sp.start : sp.end])
+    ]
+    flow_solid_rgb = [
+        _hex_to_rgb(str(sp.style))
+        for sp in logo_final_row0.spans
+        if str(sp.style).startswith("#")
+        and 20 <= sp.start < 58
+        and any(ch in _SOLID_CHARS for ch in logo_final_row0.plain[sp.start : sp.end])
+    ]
+    assert ct_rgb and all(r > g > b for r, g, b in ct_rgb)
+    assert ct_solid_rgb and min(r for r, _, _ in ct_solid_rgb) >= 220
+    assert flow_rgb and all(b > g >= r or b > r for r, g, b in flow_rgb)
+    assert flow_solid_rgb and min(b for _, _, b in flow_solid_rgb) >= 230
+
+    # 5. 窄屏自动收起右栏保持单栏居中，紧凑模式降级为单行双色 CTFLOW
+    narrow = render_splash(5, 3, 2, anim_time=math.inf, width=72)
+    assert "│" not in narrow.plain and "多 Worker 依赖图" in narrow.plain
+    compact = render_splash(5, 3, 2, compact=True)
+    assert "CTFLOW" in compact.plain
+    assert "\n" not in compact.plain
+
+
+@pytest.mark.parametrize("size", [(80, 24), (100, 30)])
+async def test_flow_editor_scrolling_visual_and_source(workbench, size):
+    """验证工作流可视化编排与源码模式均支持滚轮与键盘翻页滚动，预览拓扑自适应宽度且固定顶底栏。"""
+    from textual import events
+
+    store, settings, workflow = workbench
+    app = CTFlowApp(store, settings, workflow)
+    async with app.run_test(size=size) as pilot:
+        await command(pilot, app, "/flow new 滚动验证流程")
+        editor = app.screen
+        assert isinstance(editor, FlowEditor)
+        fields = editor.query_one("#dialog-fields", VerticalScroll)
+        assert fields.max_scroll_y > 0
+
+        # 鼠标滚轮在表单子控件上向下滚动可驱动外层滚动区
+        name_input = editor.query_one("#field-name", Input)
+        name_input.post_message(
+            events.MouseScrollDown(
+                name_input,
+                x=2,
+                y=1,
+                delta_x=0,
+                delta_y=1,
+                button=0,
+                shift=False,
+                meta=False,
+                ctrl=False,
+            )
+        )
+        await pilot.pause()
+        assert fields.scroll_y > 0
+
+        # 焦点位于尚未溢出的总任务 TextArea 时，PageUp / PageDown 转发给外层弹窗滚动
+        fields.scroll_home(animate=False, immediate=True)
+        task_area = editor.query_one("#field-task", TextArea)
+        task_area.focus()
+        await pilot.pause()
+        assert task_area.max_scroll_y == 0
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert fields.scroll_y > 0
+        await pilot.press("pageup")
+        await pilot.pause()
+        assert fields.scroll_y == 0
+
+        # 套用 2→2→1 五节点三阶段模板，滚到底部后完整展示拓扑预览框，且不超出容器宽度折行
+        tpl_btn = editor.query_one("#tpl-review", Button)
+        tpl_btn.scroll_visible(animate=False, immediate=True)
+        await pilot.pause()
+        assert await pilot.click("#tpl-review")
+        await pilot.pause()
+        fields.scroll_end(animate=False, immediate=True)
+        await pilot.pause()
+
+        preview_box = editor.query_one("#flow-preview", Static)
+        rendered_preview = preview_box.render()
+        max_line_cells = max(cell_len(line) for line in str(rendered_preview).splitlines())
+        assert max_line_cells <= preview_box.content_size.width
+        assert preview_box.region.bottom <= fields.region.bottom
+
+        close_btn = editor.query_one("#dialog-close", Button)
+        footer = editor.query_one(".dialog-footer", Static)
+        assert 0 <= close_btn.region.y < size[1]
+        assert footer.region.bottom <= size[1]
+
+        # 切换到 Mermaid 源码模式：长源码内部优先响应翻页，到底后继续翻动外层弹窗
+        fields.scroll_home(animate=False, immediate=True)
+        editor._switch_mode("source")
+        await pilot.pause()
+        if size[1] <= 24:
+            assert fields.max_scroll_y > 0
+        source_area = editor.query_one("#field-source", TextArea)
+        many_lines = "flowchart TD\n" + "\n".join(f'N{i}["节点{i} @writer"]' for i in range(1, 22))
+        source_area.load_text(many_lines)
+        source_area.focus()
+        await pilot.pause()
+        assert source_area.max_scroll_y > 0
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert source_area.scroll_y > 0
+
+
+async def test_dag_conflict_live_feedback_and_save_blocking(workbench):
+    """验证自环、回环与 ID 冲突在可视化装配、源码编辑与保存层均实时报错并禁止保存。"""
+    store, settings, workflow = workbench
+    app = CTFlowApp(store, settings, workflow)
+    async with app.run_test(size=(110, 32)) as pilot:
+        # 1. NodeScreen 编辑起点 A：下游 B 标注成环提示，勾选后立即实时报错且禁止 Ctrl+S 保存
+        await graph_click(pilot, app, "A")
+        assert isinstance(app.screen, NodeScreen)
+        deps_list = app.screen.query_one("#field-deps-list", SelectionList)
+        option_prompt = str(deps_list.get_option_at_index(0).prompt)
+        assert "勾选将成环" in option_prompt
+        deps_list.select("B")
+        await pilot.pause()
+        live_err = str(app.screen.query_one("#form-error", Static).render())
+        assert "A → B → A" in live_err and "禁止保存" in live_err
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, NodeScreen)
+        assert store.get_workflow("first") == workflow
+
+        # 取消勾选冲突依赖后错误自动消除，允许正常保存
+        deps_list.deselect("B")
+        await pilot.pause()
+        assert str(app.screen.query_one("#form-error", Static).render()) == ""
+        await pilot.press("escape")
+        await pilot.pause()
+
+        # 2. NodeScreen 新增节点：填入大小写冲突 ID 'a' 实时报错并禁止保存
+        await command(pilot, app, "/node new")
+        assert isinstance(app.screen, NodeScreen)
+        app.screen.query_one("#field-node_id", Input).value = "a"
+        await pilot.pause()
+        assert "大小写冲突" in str(app.screen.query_one("#form-error", Static).render())
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, NodeScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+
+        # 3. FlowEditor 源码模式：自环与多跳回环实时预警，禁止切回可视化且禁止保存
+        await command(pilot, app, "/flow edit")
+        editor = app.screen
+        assert isinstance(editor, FlowEditor)
+        editor._switch_mode("source")
+        await pilot.pause()
+        source_box = editor.query_one("#field-source", TextArea)
+
+        source_box.load_text('flowchart TD\nA["自环 @writer"] --> A')
+        await pilot.pause()
+        assert "自环" in str(editor.query_one("#form-error", Static).render())
+        editor._switch_mode("visual")
+        assert editor.mode == "source"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert app.screen is editor
+
+        source_box.load_text(
+            'flowchart TD\nA["一 @writer"] --> B["二 @reviewer"] --> C["三 @writer"] --> A'
+        )
+        await pilot.pause()
+        err_text = str(editor.query_one("#form-error", Static).render())
+        assert "A → B → C → A" in err_text and "禁止保存" in err_text
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert app.screen is editor
+        await pilot.press("escape")
+        await pilot.pause()
+        assert store.get_workflow("first") == workflow
+
+        # 4. App 控制层 save_workflow 强校验防线：直接传入成环 Workflow 同样抛出异常禁止落盘
+        bad = Workflow(
+            "first",
+            "非法环",
+            "任务",
+            [
+                Node("A", "一", "writer", dependencies=["B"]),
+                Node("B", "二", "reviewer", dependencies=["A"]),
+            ],
+        )
+        with pytest.raises(ValueError, match="A → B → A"):
+            app.save_workflow(bad)
+        assert store.get_workflow("first") == workflow
