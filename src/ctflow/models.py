@@ -14,9 +14,32 @@ def new_id() -> str:
     return uuid4().hex[:12]
 
 
+def upstream_signature(protocol: str, base_url: str) -> tuple[str, str]:
+    """归一化上游协议与接口根地址，用于识别 Worker 是否更换了上游服务。"""
+    raw = base_url.strip()
+    if not raw:
+        return (protocol.strip().lower(), "")
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path.rstrip("/")
+        normalized = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+    else:
+        normalized = raw.rstrip("/").lower()
+    return (protocol.strip().lower(), normalized)
+
+
+def upstream_label(base_url: str) -> str:
+    """提取适合在列表中展示的简短上游主机名。"""
+    raw = base_url.strip()
+    if not raw:
+        return "未配置上游"
+    parsed = urlparse(raw)
+    return parsed.netloc or raw
+
+
 @dataclass
 class Worker:
-    """可复用的角色配置：指定模型连接、固定提示词、技能和 MCP 服务器。"""
+    """可复用的角色配置：指定模型连接、固定提示词、技能、内置工具和 MCP 服务器。"""
 
     id: str
     name: str
@@ -28,6 +51,7 @@ class Worker:
     extra_body: dict = field(default_factory=dict)
     mcp_servers: list[str] = field(default_factory=list)
     protocol: str = "chat"
+    builtin_tools: list[str] = field(default_factory=list)
 
     def require_api(self) -> None:
         if self.protocol not in {"chat", "responses", "anthropic"}:

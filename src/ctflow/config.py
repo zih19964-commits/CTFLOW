@@ -19,7 +19,7 @@ class Settings:
     concurrency: int = 3
     timeout: float = 60
     max_tokens: int = 1200
-    max_tool_rounds: int = 4
+    max_tool_rounds: int = 8
     currency: str = "CNY"
     prices: dict[str, dict[str, float]] = field(default_factory=dict)
     mcp_servers: dict[str, dict] = field(default_factory=dict, repr=False)

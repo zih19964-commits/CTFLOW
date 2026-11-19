@@ -1,41 +1,171 @@
-/* FLUX：蓝色画布、输出区、右侧节点和底部命令。 */
+/* CTflow Studio (FLUX v2)：全圆角 TUI 视觉、启动选择页、工作台与单 Worker 对话。 */
+
 Screen {
     layout: vertical;
-    background: #0c0d10;
-    color: #e4e7ec;
+    background: #0f1117;
+    color: #dce3f0;
     layers: base menu;
     overflow: hidden hidden;
-    link-color: #75a7ff;
+    link-color: #7aa2f7;
     link-style: none;
 }
+
 #masthead {
     width: 1fr;
     height: 1;
     padding: 0 1;
-    background: #191c22;
-    color: #858d9a;
+    background: #171b24;
+    color: #7f8a9e;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
-#workspace { width: 1fr; height: 1fr; min-height: 1; }
-#main-area { width: 1fr; height: 1fr; min-width: 0; min-height: 1; }
+
+/* ==================== Hub 选择页（启动画面 + 列表 + 实时预览） ==================== */
+#hub-view {
+    width: 1fr;
+    height: 1fr;
+    padding: 0 1;
+}
+
+#splash-banner {
+    width: 1fr;
+    height: auto;
+    padding: 0 2;
+    margin: 0 0 1 0;
+    border: round #2d3545;
+    background: #141821;
+    text-wrap: nowrap;
+    overflow-x: hidden;
+}
+
+#hub-toolbar {
+    width: 1fr;
+    height: 3;
+    margin: 0 0 1 0;
+    align-vertical: middle;
+}
+
+.hub-tab {
+    width: auto;
+    min-width: 14;
+    height: 3;
+    margin: 0 1 0 0;
+    padding: 0 2;
+    border: round #2d3545;
+    background: #161a22;
+    color: #7f8a9e;
+}
+
+.hub-tab:hover {
+    background: #1e2430;
+    color: #dce3f0;
+}
+
+.hub-tab.active {
+    border: round #7aa2f7;
+    background: #1d283d;
+    color: #7aa2f7;
+    text-style: bold;
+}
+
+#hub-filter {
+    width: 1fr;
+    min-width: 16;
+    height: 3;
+    border: round #2d3545;
+    background: #161a22;
+    color: #dce3f0;
+}
+
+#hub-filter:focus {
+    border: round #7aa2f7;
+}
+
+#hub-body {
+    width: 1fr;
+    height: 1fr;
+    min-height: 5;
+}
+
+#hub-list-box {
+    width: 46%;
+    min-width: 30;
+    height: 1fr;
+    margin: 0 1 0 0;
+    padding: 0 1;
+    border: round #2d3545;
+    border-title-color: #7aa2f7;
+    border-title-background: #161a22;
+    background: #161a22;
+}
+
+#hub-list-box:focus-within {
+    border: round #7aa2f7;
+}
+
+#hub-list {
+    height: 1fr;
+    background: #161a22;
+}
+
+#hub-preview {
+    width: 1fr;
+    height: 1fr;
+    border: round #2d3545;
+    border-title-color: #7f8a9e;
+    border-title-background: #161a22;
+    background: #161a22;
+}
+
+#hub-footer {
+    width: 1fr;
+    height: 1;
+    padding: 0 1;
+    color: #7f8a9e;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* ==================== Workflow 工作台 ==================== */
+#workbench-view {
+    width: 1fr;
+    height: 1fr;
+    min-height: 1;
+}
+
+#workspace {
+    width: 1fr;
+    height: 1fr;
+    min-height: 1;
+    padding: 0 1;
+}
+
+#main-area {
+    width: 1fr;
+    height: 1fr;
+    min-width: 0;
+    min-height: 1;
+    margin: 0 1 0 0;
+}
+
 Pane {
     width: 1fr;
     min-width: 0;
     min-height: 3;
     padding: 0 1;
-    border: solid #292e38;
-    border-title-color: #858d9a;
-    border-title-background: #13161c;
-    background: #13161c;
+    border: round #2d3545;
+    border-title-color: #7f8a9e;
+    border-title-background: #161a22;
+    background: #161a22;
     overflow-x: hidden;
     overflow-y: auto;
     scrollbar-size: 1 1;
-    scrollbar-background: #13161c;
+    scrollbar-background: #161a22;
     scrollbar-color: #343d4b;
     scrollbar-color-hover: #56647a;
-    scrollbar-color-active: #75a7ff;
+    scrollbar-color-active: #7aa2f7;
 }
+
 Pane > Static.content {
     width: 1fr;
     min-width: 0;
@@ -43,110 +173,216 @@ Pane > Static.content {
     text-wrap: wrap;
     overflow-x: hidden;
 }
+
 #map-pane Static {
     link-style: none;
     link-style-hover: none;
 }
+
 #map-pane {
     height: 13;
-    border: solid #75a7ff;
-    border-title-color: #75a7ff;
+    border: round #7aa2f7;
+    border-title-color: #7aa2f7;
 }
-#reading-pane { height: 1fr; }
+
+#reading-pane {
+    height: 1fr;
+}
+
 #sidebar {
     width: 34;
     height: 1fr;
     min-width: 0;
-    border-left: solid #292e38;
-    background: #13161c;
+    padding: 0 1;
+    border: round #2d3545;
+    border-title-color: #7f8a9e;
+    border-title-background: #161a22;
+    background: #161a22;
 }
+
+#sidebar-actions {
+    height: 1;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    color: #7f8a9e;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#node-cards {
+    height: 1fr;
+}
+
+#assembly-hint {
+    height: auto;
+    max-height: 11;
+    padding: 1 1 0 1;
+    border-top: solid #262d3c;
+    color: #7f8a9e;
+    text-wrap: wrap;
+}
+
+/* ==================== 单 Worker 独立对话视图 ==================== */
+#chat-view {
+    width: 1fr;
+    height: 1fr;
+    min-height: 1;
+    padding: 0 1;
+}
+
+#chat-pane {
+    width: 1fr;
+    height: 1fr;
+    border: round #7aa2f7;
+    border-title-color: #7aa2f7;
+}
+
+/* ==================== 列表、命令浮层与底部 Composer ==================== */
 OptionList, SelectionList {
     min-width: 0;
     min-height: 1;
     border: none;
     padding: 0;
-    background: #13161c;
-    color: #e4e7ec;
+    background: #161a22;
+    color: #dce3f0;
     overflow-x: hidden;
     overflow-y: auto;
     scrollbar-size: 1 1;
-    scrollbar-background: #13161c;
+    scrollbar-background: #161a22;
     scrollbar-color: #343d4b;
 }
-OptionList:focus, SelectionList:focus { border: none; background-tint: transparent; }
-OptionList > .option-list--option { padding: 0 1; }
-OptionList > .option-list--option-hover { background: #1b222d; }
+
+OptionList:focus, SelectionList:focus {
+    border: none;
+    background-tint: transparent;
+}
+
+OptionList > .option-list--option {
+    padding: 0 1;
+}
+
+OptionList > .option-list--option-hover {
+    background: #1e2533;
+}
+
 OptionList > .option-list--option-highlighted {
-    background: #213650;
-    color: #75a7ff;
+    background: #223552;
+    color: #7aa2f7;
     text-style: bold;
 }
-#node-cards { height: 1fr; }
-#assembly-hint {
-    height: auto;
-    max-height: 10;
-    padding: 1 1 0 1;
-    border-top: solid #292e38;
-    color: #858d9a;
-    text-wrap: wrap;
-}
+
 #command-menu {
     layer: menu;
     dock: bottom;
-    offset: 0 -3;
-    width: 100%;
+    offset: 1 -4;
+    width: 96%;
     height: auto;
     max-height: 12;
-    border: solid #45546b;
+    border: round #7aa2f7;
+    background: #161a22;
 }
+
 #composer {
     width: 1fr;
-    height: 3;
+    height: 4;
     min-width: 0;
+    margin: 0 1;
     padding: 0 1;
-    border-left: solid #75a7ff;
-    background: #13161c;
+    border: round #3b465c;
+    background: #161a22;
 }
+
+#composer:focus-within {
+    border: round #7aa2f7;
+}
+
 #prompt, #prompt:focus {
     height: 1;
     min-height: 1;
     padding: 0;
     border: none;
-    background: #13161c;
+    background: #161a22;
     background-tint: transparent;
+    color: #dce3f0;
 }
+
 #input-meta {
     height: 1;
-    color: #858d9a;
+    color: #7f8a9e;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
-Screen.compact #sidebar { width: 25; }
-Screen.short #map-pane { height: 9; }
-Screen.short #assembly-hint { max-height: 6; padding: 0 1; }
 
+/* ==================== 响应式紧凑布局（80x24 / 100x30 友好） ==================== */
+Screen.compact #sidebar {
+    width: 24;
+}
+
+Screen.compact #hub-preview {
+    display: none;
+}
+
+Screen.compact #hub-list-box {
+    width: 1fr;
+    margin: 0;
+}
+
+Screen.short #map-pane {
+    height: 9;
+}
+
+Screen.short #assembly-hint {
+    max-height: 6;
+    padding: 0 1;
+}
+
+Screen.short #splash-banner {
+    margin: 0;
+}
+
+Screen.short #composer {
+    height: 3;
+    border: none;
+    border-left: thick #7aa2f7;
+}
+
+/* ==================== 圆角模态弹窗与构建器 ==================== */
 Dialog {
     align: center middle;
-    background: #000000 55%;
+    background: #000000 60%;
 }
+
 .dialog {
     width: 86%;
     max-width: 100;
     height: 90%;
-    max-height: 38;
-    padding: 0 1;
-    border: solid #75a7ff;
-    background: #13161c;
+    max-height: 40;
+    padding: 0 2;
+    border: round #7aa2f7;
+    background: #161a22;
 }
-.dialog-heading { height: 2; min-height: 2; }
+
+.dialog-wide {
+    width: 92%;
+    max-width: 112;
+    height: 92%;
+    max-height: 42;
+}
+
+.dialog-heading {
+    height: 2;
+    min-height: 2;
+}
+
 .dialog-title {
     width: 1fr;
     height: 1;
-    color: #75a7ff;
+    color: #7aa2f7;
     text-style: bold;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
+
 #dialog-close, #dialog-close:focus {
     width: 3;
     min-width: 3;
@@ -154,10 +390,15 @@ Dialog {
     min-height: 1;
     padding: 0;
     border: none;
-    background: #13161c;
-    color: #858d9a;
+    background: #161a22;
+    color: #7f8a9e;
 }
-#dialog-close:hover { color: #f28b91; background: #263448; }
+
+#dialog-close:hover {
+    color: #f7768e;
+    background: #263145;
+}
+
 #dialog-fields {
     height: 1fr;
     min-height: 1;
@@ -165,31 +406,164 @@ Dialog {
     scrollbar-size: 1 1;
     scrollbar-color: #343d4b;
 }
-#dialog-fields Label { height: auto; margin: 1 0 0 0; color: #858d9a; }
-#dialog-fields Input, #dialog-fields Select { height: 3; margin: 0; }
-#refresh-models {
+
+#dialog-fields Label {
+    height: auto;
+    margin: 1 0 0 0;
+    color: #8f9bb0;
+}
+
+.field-note {
+    height: auto;
+    color: #7f8a9e;
+    margin: 0 0 1 0;
+}
+
+.confirm-body {
+    height: auto;
+    padding: 1 0;
+    color: #dce3f0;
+}
+
+#dialog-fields Input, #dialog-fields Select {
     height: 3;
-    min-height: 3;
     margin: 0;
-    background: #213650;
-    color: #75a7ff;
-    border: none;
 }
+
 #dialog-fields Input, #dialog-fields TextArea, #dialog-fields SelectCurrent {
-    background: #191e27;
-    border: solid #343d4b;
+    background: #1b202b;
+    border: round #343d4b;
+    color: #dce3f0;
 }
-#dialog-fields Input:focus, #dialog-fields TextArea:focus { border: solid #75a7ff; }
-#dialog-fields TextArea { height: 7; min-height: 5; }
-#dialog-fields #field-source { height: 15; }
-#dialog-fields #field-extra_body { height: 5; }
-#skill-options { height: auto; min-height: 3; max-height: 10; margin: 1 0; }
-#picker-options { height: auto; min-height: 4; max-height: 20; margin: 1 0; }
-#form-error { height: auto; max-height: 3; color: #f28b91; }
+
+#dialog-fields Input:focus, #dialog-fields TextArea:focus {
+    border: round #7aa2f7;
+}
+
+#dialog-fields TextArea {
+    height: 6;
+    min-height: 4;
+}
+
+#dialog-fields #field-task {
+    height: 4;
+    min-height: 3;
+}
+
+#dialog-fields #field-source {
+    height: 14;
+}
+
+#dialog-fields #field-extra_body {
+    height: 5;
+}
+
+.action-row, .template-row, .mode-bar {
+    width: 1fr;
+    height: auto;
+    min-height: 1;
+    margin: 0 0 1 0;
+}
+
+Button {
+    height: 1;
+    min-height: 1;
+    min-width: 6;
+    margin: 0 1 0 0;
+    padding: 0 2;
+    border: none;
+    background: #222938;
+    color: #dce3f0;
+}
+
+Button:hover {
+    background: #2c364b;
+}
+
+.btn-primary {
+    background: #223552;
+    color: #7aa2f7;
+    text-style: bold;
+}
+
+.btn-primary:hover {
+    background: #2a4369;
+}
+
+.btn-subtle {
+    background: #222938;
+    color: #dce3f0;
+}
+
+.btn-danger {
+    background: #3a202b;
+    color: #f7768e;
+}
+
+.btn-chip {
+    background: #1d2d33;
+    color: #73daca;
+}
+
+.btn-chip:hover {
+    background: #253d45;
+}
+
+.mode-tab {
+    background: #1a202c;
+    color: #7f8a9e;
+}
+
+.mode-tab.active {
+    background: #223552;
+    color: #7aa2f7;
+    text-style: bold;
+}
+
+#flow-nodes {
+    height: auto;
+    min-height: 4;
+    max-height: 9;
+    margin: 0 0 1 0;
+    border: round #2d3545;
+}
+
+.preview-box {
+    width: 1fr;
+    height: auto;
+    min-height: 5;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    border: round #2d3545;
+    background: #131720;
+}
+
+#skill-options, #builtin-tool-options, #field-deps-list {
+    height: auto;
+    min-height: 3;
+    max-height: 8;
+    margin: 0 0 1 0;
+    border: round #2d3545;
+}
+
+#picker-options {
+    height: auto;
+    min-height: 4;
+    max-height: 20;
+    margin: 1 0;
+    border: round #2d3545;
+}
+
+#form-error {
+    height: auto;
+    max-height: 3;
+    color: #f7768e;
+}
+
 .dialog-footer {
     height: 1;
     min-height: 1;
-    color: #858d9a;
+    color: #7f8a9e;
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }

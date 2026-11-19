@@ -5,9 +5,9 @@ import copy
 import json
 from collections.abc import Callable
 
+from ctflow.builtin_tools import CompositeTools, has_configured_tools, validate_builtin_tools
 from ctflow.config import Settings
 from ctflow.graph import topological_layers, validate_workflow
-from ctflow.mcp_tools import MCPTools
 from ctflow.models import Node, NodeRun, Run, Workflow, new_id, now
 from ctflow.provider import ModelClient, Reply
 from ctflow.runtime import RuntimeResponseError, SingleRequestRuntime, ToolRuntime
@@ -42,6 +42,7 @@ class Engine:
         for node in workflow.nodes:
             workers[node.worker_id] = copy.deepcopy(all_workers[node.worker_id])
         for worker in workers.values():
+            validate_builtin_tools(worker.builtin_tools)
             unknown = set(worker.mcp_servers) - self.settings.mcp_servers.keys()
             if unknown:
                 raise ValueError(
@@ -276,20 +277,46 @@ class Engine:
     ) -> Reply:
         worker = run.workers[node.worker_id]
         messages = self._messages(run, node)
-        if not worker.mcp_servers:
+        if not has_configured_tools(worker):
             return await SingleRequestRuntime(client).execute(worker.model, messages, on_text)
 
         def on_tool(event: str, name: str, detail: str = "") -> None:
+            prefix = "MCP 工具" if name.startswith("mcp_") else "工具"
             if event == "start":
-                self._log(state, f"调用 MCP 工具 {name}", type="tool")
+                self._log(state, f"调用{prefix} {name}", type="tool")
             elif event == "end":
-                self._log(state, f"MCP 工具完成 {name}", type="tool")
+                self._log(state, f"{prefix}完成 {name}", type="tool")
             else:
-                self._log(state, f"MCP 工具失败 {name}：{detail}", type="tool")
+                self._log(state, f"{prefix}失败 {name}：{detail}", type="tool")
 
-        async with MCPTools(self.settings, worker) as tools:
+        def on_tool_step(step: dict) -> None:
+            redacted_step = {
+                **step,
+                "arguments": self._redact(str(step.get("arguments", ""))),
+                "result": self._redact(str(step.get("result", ""))),
+            }
+            # 更新同 step 编号的记录（running -> ok/error），保证实时状态与终态一致。
+            for existing in reversed(state.logs):
+                if (
+                    existing.get("type") == "tool_step"
+                    and existing.get("step") == redacted_step["step"]
+                ):
+                    existing.update(redacted_step)
+                    self._emit("log", state.node_id, **existing)
+                    return
+            entry = {
+                "at": now(),
+                "type": "tool_step",
+                "message": redacted_step["name"],
+                **redacted_step,
+            }
+            state.logs.append(entry)
+            self._emit("log", state.node_id, **entry)
+
+        async with CompositeTools(self.settings, worker) as tools:
             return await ToolRuntime(
                 client,
                 self.settings.max_tool_rounds,
                 on_tool=on_tool,
+                on_tool_step=on_tool_step,
             ).execute(worker.model, messages, on_text, tools)

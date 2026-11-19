@@ -1,45 +1,78 @@
-"""FLUX 终端工作台：命令编排、直接装配、真实运行。"""
+"""CTflow Studio (FLUX v2) 终端工作台：启动选择页、可视化编排、多步执行与单 Worker 对话。"""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.markdown import Markdown
+from rich.style import Style
 from rich.text import Text
 from rich.theme import Theme
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
-from textual.widgets import (
-    Button,
-    Input,
-    Label,
-    OptionList,
-    Select,
-    SelectionList,
-    Static,
-    TextArea,
-)
+from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
+from ctflow.builtin_tools import BUILTIN_TOOL_CATALOG
+from ctflow.chat import (
+    ChatSession,
+    export_chat_markdown,
+    load_latest_chat,
+    run_chat_turn,
+)
 from ctflow.engine import Engine
-from ctflow.graph import parse_workflow, to_mermaid, validate_workflow
-from ctflow.models import Node, NodeRun, Run, Worker, Workflow, new_id, now
+from ctflow.graph import to_mermaid
+from ctflow.models import Node, NodeRun, Run, Worker, Workflow, new_id, now, upstream_label
 from ctflow.provider import ModelClient
-from ctflow.rendering import BLUE, MUTED, ORANGE, RED, TEXT, fit, graph, status_text
-from ctflow.tools import discover_skills, read_skills
+from ctflow.rendering import (
+    BLUE,
+    GREEN,
+    LINE,
+    MUTED,
+    ORANGE,
+    RED,
+    TEXT,
+    extract_tool_steps,
+    fit,
+    format_tool_steps_markdown,
+    graph,
+    render_splash,
+    status_text,
+    workflow_summary,
+)
+from ctflow.ui_screens import (
+    ConfirmScreen,
+    Dialog,
+    FlowEditor,
+    FormScreen,
+    ModelPicker,
+    NodeScreen,
+    PickerScreen,
+    WorkerScreen,
+    _next_node_id,
+)
 
 if TYPE_CHECKING:
     from ctflow.config import Settings
     from ctflow.storage import Store
+
+__all__ = [
+    "CTFlowApp",
+    "ConfirmScreen",
+    "Dialog",
+    "FlowEditor",
+    "FormScreen",
+    "ModelPicker",
+    "NodeScreen",
+    "PickerScreen",
+    "WorkerScreen",
+]
 
 
 def elapsed(result: NodeRun | Run) -> str:
@@ -52,6 +85,10 @@ def elapsed(result: NodeRun | Run) -> str:
 
 def money(cost: float | None, currency: str) -> str:
     return "费用待配置" if cost is None else f"{cost:.4f} {currency}"
+
+
+def _link(label: str, action: str, color: str = BLUE, *, bold: bool = False) -> tuple[str, Style]:
+    return (label, Style(color=color, bold=bold, meta={"@click": f"app.{action}"}))
 
 
 class Pane(VerticalScroll):
@@ -72,6 +109,13 @@ class CommandInput(Input):
         Binding("tab", "complete", show=False, priority=True),
     ]
 
+    def on_key(self, event: events.Key) -> None:
+        # 借鉴 Codex CLI：空输入框按 ← 直接退回 Workflow/Worker 选择页，输入文字时正常移动光标。
+        if event.key == "left" and not self.value:
+            event.stop()
+            event.prevent_default()
+            self.app.action_back_to_hub()
+
     def action_suggest(self, step: int) -> None:
         self.app.move_suggestion(step)
 
@@ -79,412 +123,36 @@ class CommandInput(Input):
         self.app.accept_suggestion()
 
 
-class Dialog(ModalScreen):
-    """固定标题、关闭和快捷键提示，字段区独立滚动。"""
-
-    BINDINGS = [Binding("escape", "cancel", "取消", priority=True)]
-
-    def __init__(self, title: str) -> None:
-        super().__init__()
-        self.heading = title
-
-    def body(self) -> ComposeResult:
-        yield Static("")
-
-    def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog"):
-            with Horizontal(classes="dialog-heading"):
-                yield Static(self.heading, classes="dialog-title", markup=False)
-                yield Button("×", id="dialog-close", tooltip="取消未保存修改 · Esc")
-            with VerticalScroll(id="dialog-fields"):
-                yield from self.body()
-            yield Static("", id="form-error", markup=False)
-            yield Static("Ctrl+S 保存 · Esc 取消", classes="dialog-footer")
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-    @on(Button.Pressed, "#dialog-close")
-    def close_dialog(self, event: Button.Pressed) -> None:
-        event.stop()
-        self.action_cancel()
-
-
-class FormScreen(Dialog):
-    BINDINGS = [Binding("ctrl+s", "save", "保存", priority=True)]
-
-    def __init__(
-        self,
-        title: str,
-        fields: dict[str, tuple[str, str]],
-        *,
-        multiline: tuple[str, ...] = (),
-        choices: dict[str, list[tuple[str, str]]] | None = None,
-        required: tuple[str, ...] = (),
-        passwords: tuple[str, ...] = (),
-    ) -> None:
-        super().__init__(title)
-        self.fields, self.multiline = fields, multiline
-        self.choices, self.required = choices or {}, required
-        self.passwords = passwords
-
-    def body(self) -> ComposeResult:
-        for key, (label, value) in self.fields.items():
-            yield Label(label)
-            if key in self.multiline:
-                yield TextArea(value, id=f"field-{key}", show_line_numbers=key == "source")
-            elif key in self.choices:
-                yield Select(self.choices[key], value=value, allow_blank=False, id=f"field-{key}")
-            else:
-                yield Input(value, id=f"field-{key}", password=key in self.passwords)
-
-    def on_mount(self) -> None:
-        self.query_one(f"#field-{next(iter(self.fields))}").focus()
-
-    def values(self) -> dict[str, str]:
-        result = {}
-        for key in self.fields:
-            widget = self.query_one(f"#field-{key}")
-            if isinstance(widget, TextArea):
-                result[key] = widget.text
-            else:
-                value = str(widget.value)
-                result[key] = value if key in self.passwords else value.strip()
-        return result
-
-    def validate(self, values: dict[str, str]) -> object:
-        for key in self.required:
-            if not values[key].strip():
-                raise ValueError(f"请填写{self.fields[key][0]}")
-        return values
-
-    def action_save(self) -> None:
-        try:
-            result = self.validate(self.values())
-        except (ValueError, OSError, RuntimeError) as exc:
-            self.query_one("#form-error", Static).update(self.redact(str(exc)))
-            return
-        self.dismiss(result)
-
-    def redact(self, text: str) -> str:
-        return self.app.redact(text)
-
-
-class WorkerScreen(FormScreen):
-    def __init__(self, worker: Worker, models: list[str], workspace: Path) -> None:
-        self.worker = deepcopy(worker)
-        self.models = list(dict.fromkeys([worker.model, *models]))
-        self.workspace = workspace
-        self.skills = discover_skills(workspace)
-        super().__init__(
-            f"Worker 配置 · @{worker.id}",
-            {
-                "name": ("Worker 名称", worker.name),
-                "model": ("模型 ID", worker.model),
-                "protocol": ("上游协议", worker.protocol),
-                "base_url": ("Base URL · 自定义上游根地址", worker.base_url),
-                "api_key": ("API Key · 平台加密后保存在本机", worker.api_key),
-                "extra_body": (
-                    "协议附加参数 extra_body · JSON 对象",
-                    json.dumps(worker.extra_body, ensure_ascii=False, indent=2),
-                ),
-                "mcp_servers": (
-                    "MCP 服务器 · 逗号分隔，名称在 config.json 的 mcp_servers 中登记",
-                    ", ".join(worker.mcp_servers),
-                ),
-                "prompt": ("固定上下文", worker.prompt),
-            },
-            multiline=("prompt", "extra_body"),
-            required=("name", "model"),
-            passwords=("api_key",),
-            choices={
-                "protocol": [
-                    ("Chat Completions", "chat"),
-                    ("OpenAI Responses", "responses"),
-                    ("Anthropic Messages", "anthropic"),
-                ]
-            },
-        )
-
-    def body(self) -> ComposeResult:
-        yield Label(f"@{self.worker.id} 的模型 · 使用下方连接草稿刷新")
-        yield Button("刷新模型", id="refresh-models")
-        yield Select(
-            [(m, m) for m in self.models],
-            value=self.worker.model,
-            allow_blank=False,
-            id="model-choice",
-        )
-        yield from super().body()
-        yield Label("@技能 · Space 多选，打开配置时重新发现")
-        yield Static(str(self.workspace / "skill" / "<name>" / "SKILL.md"), markup=False)
-        names = list(dict.fromkeys([*self.skills, *self.worker.skills]))
-        yield SelectionList[str](
-            *[
-                (
-                    f"@{s}" + (" · 文件缺失" if s not in self.skills else ""),
-                    s,
-                    s in self.worker.skills,
-                )
-                for s in names
-            ],
-            id="skill-options",
-        )
-        if not names:
-            yield Static("复制技能文件后重新打开 /worker。", markup=False)
-
-    @on(Select.Changed, "#model-choice")
-    def choose_model(self, event: Select.Changed) -> None:
-        if event.value is not Select.BLANK:
-            self.query_one("#field-model", Input).value = str(event.value)
-
-    @on(Button.Pressed, "#refresh-models")
-    def refresh_clicked(self, event: Button.Pressed) -> None:
-        event.stop()
-        event.button.disabled = True
-        event.button.label = "刷新中…"
-        self.run_worker(self.refresh_models(), group="models", exclusive=True)
-
-    async def refresh_models(self) -> None:
-        button = self.query_one("#refresh-models", Button)
-        feedback = self.query_one("#form-error", Static)
-        feedback.update("")
-        draft = None
-        try:
-            draft = self.draft()
-            models = await self.app.fetch_models(draft)
-            current_draft = self.draft()
-            if (current_draft.base_url, current_draft.api_key, current_draft.extra_body) != (
-                draft.base_url,
-                draft.api_key,
-                draft.extra_body,
-            ):
-                feedback.update("连接已修改，请重新刷新模型")
-                return
-            current = self.query_one("#field-model", Input).value
-            choice = self.query_one("#model-choice", Select)
-            selected = current.strip() or str(choice.value)
-            self.models = list(dict.fromkeys([selected, *models]))
-            # 刷新候选项不触发表单回填，保留正在编辑的模型 ID 和其余草稿。
-            with self.prevent(Select.Changed):
-                choice.set_options([(model, model) for model in self.models])
-                choice.value = selected
-            feedback.update(f"已刷新 · @{draft.id} · {len(models)} 个模型")
-        except Exception as exc:
-            feedback.update(draft.redact(str(exc)) if draft else self.redact(str(exc)))
-        finally:
-            button.disabled = False
-            button.label = "刷新模型"
-
-    def draft(self, values: dict[str, str] | None = None) -> Worker:
-        values = self.values() if values is None else values
-        try:
-            extra_body = json.loads(values["extra_body"])
-        except json.JSONDecodeError:
-            raise ValueError("附加参数 extra_body 必须是合法的 JSON 对象") from None
-        if not isinstance(extra_body, dict):
-            raise ValueError("附加参数 extra_body 必须是 JSON 对象")
-        skills = list(self.query_one("#skill-options", SelectionList).selected)
-        mcp_servers = [
-            name.strip().lstrip("@")
-            for name in re.split(r"[,，\n]", values["mcp_servers"])
-            if name.strip()
-        ]
-        return Worker(
-            self.worker.id,
-            values["name"],
-            values["model"],
-            values["prompt"],
-            skills,
-            base_url=values["base_url"],
-            api_key=values["api_key"],
-            extra_body=extra_body,
-            mcp_servers=mcp_servers,
-            protocol=values["protocol"],
-        )
-
-    def redact(self, text: str) -> str:
-        draft = deepcopy(self.worker)
-        draft.api_key = self.query_one("#field-api_key", Input).value
-        return self.app.redact(draft.redact(text))
-
-    def validate(self, values: dict[str, str]) -> Worker:
-        super().validate(values)
-        worker = self.draft(values)
-        unknown = set(worker.mcp_servers) - self.app.settings.mcp_servers.keys()
-        if unknown:
-            raise ValueError(f"未登记的 MCP 服务器：{', '.join(sorted(unknown))}")
-        skills = worker.skills
-        read_skills(self.workspace, skills)
-        return worker
-
-
-class NodeScreen(FormScreen):
-    def __init__(self, node: Node, workflow: Workflow, workers: list[Worker]) -> None:
-        self.node, self.workflow = node, deepcopy(workflow)
-        self.worker_catalog = {w.id: w for w in workers}
-        super().__init__(
-            f"{node.id} · 装配 Worker",
-            {
-                "worker": ("引用 Worker · /worker <id> 编辑固定装配", node.worker_id),
-                "label": ("节点名称", node.label),
-                "task": ("节点补充任务", node.task),
-                "deps": ("直接上游节点 ID · 逗号分隔", ", ".join(node.dependencies)),
-            },
-            multiline=("task",),
-            choices={"worker": [(f"@{w.id} · {w.name}", w.id) for w in workers]},
-            required=("label",),
-        )
-
-    def validate(self, values: dict[str, str]) -> Node:
-        super().validate(values)
-        node = Node(
-            self.node.id,
-            values["label"],
-            values["worker"],
-            values["task"],
-            [p.strip() for p in re.split(r"[,，\n]", values["deps"]) if p.strip()],
-        )
-        self.workflow.nodes = [node if n.id == node.id else n for n in self.workflow.nodes]
-        validate_workflow(self.workflow, self.worker_catalog)
-        return node
-
-
-class FlowEditor(FormScreen):
-    def __init__(self, workflow: Workflow, workers: list[Worker]) -> None:
-        self.workflow = workflow
-        self.worker_catalog = {w.id: w for w in workers}
-        source = to_mermaid(workflow) if workflow.nodes else "flowchart TD\n"
-        super().__init__(
-            "工作流 · 编辑名称与依赖图",
-            {
-                "name": ("工作流名称", workflow.name),
-                "task": ("总任务", workflow.task),
-                "source": ('Mermaid · A["节点名称 @worker_id"]，A --> B', source),
-            },
-            multiline=("task", "source"),
-            required=("name", "source"),
-        )
-
-    def validate(self, values: dict[str, str]) -> Workflow:
-        super().validate(values)
-        result = parse_workflow(
-            values["source"],
-            self.worker_catalog,
-            workflow_id=self.workflow.id,
-            name=values["name"],
-            task=values["task"],
-        )
-        # 图文本只表达结构；同 ID 节点的补充任务保持原值。
-        tasks = {n.id: n.task for n in self.workflow.nodes}
-        for node in result.nodes:
-            node.task = tasks.get(node.id, "")
-        return result
-
-
-class PickerScreen(Dialog):
-    def __init__(self, title: str, options: list[tuple[str, Text]], hint: str) -> None:
-        super().__init__(title)
-        self.options, self.hint = options, hint
-
-    def body(self) -> ComposeResult:
-        yield Input(placeholder="输入名称或 ID 筛选", id="picker-filter")
-        yield OptionList(id="picker-options", markup=False)
-        yield Static(self.hint, markup=False)
-
-    def on_mount(self) -> None:
-        self.query_one(".dialog-footer", Static).update("↑↓ 选择 · Enter 打开 · Esc 取消")
-        self.filter_options("")
-        self.query_one("#picker-options", OptionList).focus()
-
-    def filter_options(self, query: str) -> None:
-        listing = self.query_one("#picker-options", OptionList)
-        listing.clear_options()
-        listing.add_options(
-            Option(label, id=key)
-            for key, label in self.options
-            if query.casefold() in f"{key} {label.plain}".casefold()
-        )
-        listing.highlighted = 0 if listing.option_count else None
-
-    @on(Input.Changed, "#picker-filter")
-    def filter_changed(self, event: Input.Changed) -> None:
-        self.filter_options(event.value)
-
-    @on(Input.Submitted, "#picker-filter")
-    def filter_submit(self) -> None:
-        listing = self.query_one("#picker-options", OptionList)
-        if listing.highlighted is not None:
-            self.dismiss(listing.get_option_at_index(listing.highlighted).id)
-
-    @on(OptionList.OptionSelected, "#picker-options")
-    def choose(self, event: OptionList.OptionSelected) -> None:
-        event.stop()
-        self.dismiss(event.option.id)
-
-
-class ModelPicker(PickerScreen):
-    def __init__(self, worker: Worker, models: list[str]) -> None:
-        self.worker = deepcopy(worker)
-        super().__init__(
-            f"模型 · Worker @{worker.id} · {worker.name}",
-            [(model, Text(model, BLUE)) for model in models],
-            f"选择查看 ID · /worker {worker.id} 配置模型",
-        )
-
-    def body(self) -> ComposeResult:
-        yield Button("刷新模型", id="refresh-models")
-        yield from super().body()
-
-    @on(Button.Pressed, "#refresh-models")
-    def refresh_clicked(self, event: Button.Pressed) -> None:
-        event.stop()
-        event.button.disabled = True
-        event.button.label = "刷新中…"
-        self.run_worker(self.refresh_models(), group="models", exclusive=True)
-
-    async def refresh_models(self) -> None:
-        button = self.query_one("#refresh-models", Button)
-        feedback = self.query_one("#form-error", Static)
-        feedback.update("")
-        try:
-            models = await self.app.fetch_models(self.worker)
-            self.app.worker_models[self.worker.id] = models
-            self.options = [(model, Text(model, BLUE)) for model in models]
-            self.filter_options(self.query_one("#picker-filter", Input).value)
-            feedback.update(f"已刷新 · @{self.worker.id} · {len(models)} 个模型")
-        except Exception as exc:
-            feedback.update(self.worker.redact(str(exc)))
-        finally:
-            button.disabled = False
-            button.label = "刷新模型"
-
-
 COMMANDS = [
+    ("/hub", "返回工作流与 Worker 选择页（快捷键 ←）"),
+    ("/chat", "进入单 Worker 独立对话 · /chat <worker_id>"),
     ("/worker", "选择 Worker 配置"),
     ("/worker new", "新增 Worker"),
     ("/models", "刷新所选节点 Worker 的模型 · /models <worker_id>"),
     ("/flow", "选择并加载工作流"),
-    ("/flow new", "新建工作流"),
-    ("/flow edit", "编辑工作流名称和图"),
+    ("/flow new", "可视化新建工作流"),
+    ("/flow edit", "可视化编辑当前工作流"),
     ("/flow save", "保存 · 加名称则另存一套"),
+    ("/node", "装配节点 · /node <id> 或 /node new"),
+    ("/node new", "向当前工作流新增节点"),
     ("/run", "运行当前工作流"),
-    ("/node", "装配节点 · /node <id>"),
-    ("/run stop", "停止当前运行"),
+    ("/run stop", "停止当前运行或对话"),
     ("/view flow", "编排视图"),
-    ("/view run", "执行视图"),
-    ("/view result", "结果视图"),
-    ("/export", "导出真实运行结果"),
+    ("/view run", "执行视图（含工具步骤）"),
+    ("/view result", "结果汇总视图"),
+    ("/clear", "单聊模式下开启新对话"),
+    ("/export", "导出运行结果或单聊记录"),
 ]
 
 
 class CTFlowApp(App[None]):
-    TITLE = "CTflow / FLUX"
+    TITLE = "CTflow Studio"
     CSS_PATH = "ui.tcss"
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [
         Binding("ctrl+q", "quit", show=False, priority=True),
         Binding("ctrl+p", "commands", show=False),
+        Binding("ctrl+k", "back_to_hub", show=False),
         Binding("escape", "escape", show=False),
     ]
 
@@ -495,30 +163,41 @@ class CTFlowApp(App[None]):
         workflow: Workflow | None = None,
         auto_run: bool = False,
         client: ModelClient | None = None,
+        *,
+        start_in_hub: bool = False,
     ) -> None:
         super().__init__()
         self.store, self.settings, self.client = store, settings, client
         workflows = store.list_workflows()
         self.workflow = deepcopy(workflow) if workflow else (workflows[0] if workflows else None)
         self.auto_run = auto_run
+        self.page = "hub" if (start_in_hub and not auto_run) else "workbench"
+        self.hub_tab = "workflows"
+        self.hub_query = ""
+        self.hub_items: list[tuple[str, str]] = []
         self.worker_models: dict[str, list[str]] = {}
         self.view_run: Run | None = None
         self.view_name = "flow"
         self.selected_node = (
             self.workflow.nodes[0].id if self.workflow and self.workflow.nodes else ""
         )
+        self.chat_worker_id: str = ""
+        self.chat_session: ChatSession | None = None
+        self.chat_busy = False
         self.engine = Engine(store, settings, client=client, on_event=self.on_engine_event)
         self.busy = False
         self._run_task: asyncio.Task | None = None
         self._model_task: asyncio.Task | None = None
+        self._chat_task: asyncio.Task | None = None
         self._stop_requested = False
         self._shutting_down = False
         self.frame = 0
         self.matches: list[tuple[str, str]] = []
-        self.message = "输入目标保存总任务 · / 打开命令"
+        self.message = "输入目标保存总任务 · / 打开命令 · 空框按 ← 返回选择页"
         self.last_export: Path | None = None
         self._cards_key: tuple = ()
         self._reading_key: tuple = ()
+        self._chat_key: tuple = ()
 
     @property
     def root(self):
@@ -526,16 +205,40 @@ class CTFlowApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Static(id="masthead", markup=False)
-        with Horizontal(id="workspace"):
-            with Vertical(id="main-area"):
-                yield Pane(id="map-pane", can_focus=False)
-                yield Pane(id="reading-pane")
-            with Vertical(id="sidebar"):
-                yield OptionList(id="node-cards", markup=False)
-                yield Static(id="assembly-hint", markup=False)
+
+        with Vertical(id="hub-view"):
+            yield Static(id="splash-banner", markup=False)
+            with Horizontal(id="hub-toolbar"):
+                yield Button("❖ Workflows", id="hub-tab-workflows", classes="hub-tab active")
+                yield Button("◉ Workers", id="hub-tab-workers", classes="hub-tab")
+                yield Button("◷ Runs", id="hub-tab-runs", classes="hub-tab")
+                yield Input(placeholder="按 / 筛选名称、ID 或模型…", id="hub-filter")
+            with Horizontal(id="hub-body"):
+                with Vertical(id="hub-list-box"):
+                    yield OptionList(id="hub-list", markup=False)
+                yield Pane(id="hub-preview", can_focus=False)
+            yield Static(id="hub-footer", markup=False)
+
+        with Vertical(id="workbench-view"):
+            with Horizontal(id="workspace"):
+                with Vertical(id="main-area"):
+                    yield Pane(id="map-pane", can_focus=False)
+                    yield Pane(id="reading-pane")
+                with Vertical(id="sidebar"):
+                    yield Static(id="sidebar-actions", markup=False)
+                    yield OptionList(id="node-cards", markup=False)
+                    yield Static(id="assembly-hint", markup=False)
+
+        with Vertical(id="chat-view"):
+            yield Pane(id="chat-pane")
+
         yield OptionList(id="command-menu", markup=False)
         with Vertical(id="composer"):
-            yield CommandInput(placeholder="描述目标，或输入 /", id="prompt", select_on_focus=False)
+            yield CommandInput(
+                placeholder="描述目标，或输入 /（空框按 ← 返回选择页）",
+                id="prompt",
+                select_on_focus=False,
+            )
             yield Static(id="input-meta", markup=False)
 
     def on_mount(self) -> None:
@@ -544,39 +247,68 @@ class CTFlowApp(App[None]):
                 {
                     "markdown.h1": "bold " + TEXT,
                     "markdown.h2": "bold " + BLUE,
-                    "markdown.h3": "bold " + BLUE,
+                    "markdown.h3": "bold " + ORANGE,
                     "markdown.code": ORANGE,
                     "markdown.link": BLUE,
                     "markdown.item.bullet": BLUE,
+                    "markdown.block_quote": GREEN,
                 }
             )
         )
+        for selector in ("#masthead", "#sidebar-actions", "#assembly-hint"):
+            self.root.query_one(selector, Static).auto_links = False
         self.root.query_one("#map-pane", Pane).query_one(Static).auto_links = False
         self.root.query_one("#command-menu").display = False
-        self.root.query_one("#prompt", Input).cursor_blink = False
-        self.root.query_one("#prompt", Input).focus()
-        self.render_workbench()
+        prompt = self.root.query_one("#prompt", Input)
+        prompt.cursor_blink = False
+        self._apply_page_visibility()
+        self.render_current()
         self.set_message(self.message)
         self.set_interval(0.16, self.tick)
+        if self.page == "hub":
+            self.root.query_one("#hub-list", OptionList).focus()
+        else:
+            prompt.focus()
         if self.auto_run:
             self.call_after_refresh(self.action_run)
 
     def on_resize(self, event: events.Resize) -> None:
-        self.root.set_class(event.size.width < 110, "compact")
+        self.root.set_class(event.size.width < 104, "compact")
         self.root.set_class(event.size.height < 28, "short")
         if self.is_mounted:
-            self.call_after_refresh(self.render_workbench)
+            self.call_after_refresh(self.render_current)
 
     def tick(self) -> None:
-        if self.busy:
+        if self.busy or self.chat_busy:
             self.frame += 1
+            self.render_current()
+
+    def _apply_page_visibility(self) -> None:
+        self.root.query_one("#hub-view").display = self.page == "hub"
+        self.root.query_one("#workbench-view").display = self.page == "workbench"
+        self.root.query_one("#chat-view").display = self.page == "chat"
+        self.root.query_one("#composer").display = self.page != "hub"
+        if self.page == "hub":
+            self.root.query_one("#command-menu").display = False
+
+    def render_current(self) -> None:
+        if not self.is_mounted:
+            return
+        if self.page == "hub":
+            self.render_hub()
+        elif self.page == "chat":
+            self.render_chat()
+        else:
             self.render_workbench()
 
     def set_message(self, text: str, *, error: bool = False) -> None:
         self.message = self.redact(text)
-        self.root.query_one("#input-meta", Static).update(
-            Text(self.message, RED if error else MUTED)
-        )
+        if self.is_mounted:
+            self.root.query_one("#input-meta", Static).update(
+                Text(self.message, RED if error else MUTED)
+            )
+            if self.page == "hub":
+                self._render_hub_footer(error=error)
 
     def redact(self, text: str) -> str:
         workers = self.store.list_workers()
@@ -590,15 +322,579 @@ class CTFlowApp(App[None]):
         return text
 
     def require_editable(self) -> None:
-        if self.busy:
-            raise ValueError("运行中，请用 /run stop 停止后再编辑或切换")
+        if self.busy or self.chat_busy:
+            raise ValueError("任务执行中，请用 /run stop 停止后再编辑或切换")
 
     def current_workflow(self) -> Workflow:
         if self.workflow is None:
             raise ValueError("请先 /worker new 配置 Worker，再 /flow new 创建工作流")
         return self.workflow
 
-    def save_workflow(self, workflow: Workflow) -> None:
+    # ==================== 页面导航动作（Codex 风格 ← / →） ====================
+    def action_back_to_hub(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
+        if self.page == "hub":
+            return
+        self.page = "hub"
+        self._apply_page_visibility()
+        self.render_hub()
+        self.call_after_refresh(self.render_hub)
+        self.root.query_one("#hub-list", OptionList).focus()
+
+    def action_open_workbench(self) -> None:
+        self.page = "workbench"
+        self._apply_page_visibility()
+        prompt = self.root.query_one("#prompt", Input)
+        prompt.placeholder = "描述目标，或输入 /（空框按 ← 返回选择页）"
+        self.render_workbench()
+        self.call_after_refresh(self.render_workbench)
+        prompt.focus()
+
+    def action_switch_view(self, name: str) -> None:
+        if name in {"flow", "run", "result"}:
+            self.view_name = name
+            self.page = "workbench"
+            self._apply_page_visibility()
+            self.render_workbench()
+
+    def action_quick_flow_picker(self) -> None:
+        try:
+            self.require_editable()
+            self._open_flow_picker()
+        except ValueError as exc:
+            self.set_message(str(exc), error=True)
+
+    def action_add_node_quick(self) -> None:
+        try:
+            self.require_editable()
+            workflow = deepcopy(self.current_workflow())
+            workers = self.store.list_workers()
+            if not workers:
+                raise ValueError("请先新增 Worker")
+            next_id = _next_node_id({n.id for n in workflow.nodes})
+            deps = (
+                [self.selected_node] if self.selected_node in {n.id for n in workflow.nodes} else []
+            )
+            new_node = Node(next_id, f"步骤 {next_id}", workers[0].id, "", deps)
+
+            def on_added(node: Node | None) -> None:
+                if node is not None:
+                    updated = deepcopy(self.current_workflow())
+                    updated.nodes.append(node)
+                    self.selected_node = node.id
+                    self.save_workflow(updated)
+
+            self.push_screen(NodeScreen(new_node, workflow, workers, is_new=True), on_added)
+        except ValueError as exc:
+            self.set_message(str(exc), error=True)
+
+    def action_edit_flow_quick(self) -> None:
+        try:
+            self.open_flow_editor()
+        except ValueError as exc:
+            self.set_message(str(exc), error=True)
+
+    def action_toggle_run(self) -> None:
+        if self.busy:
+            self.action_stop()
+        else:
+            asyncio.create_task(self.action_run())
+
+    def action_open_chat_current(self) -> None:
+        worker_id = ""
+        if self.workflow and self.selected_node:
+            node = next((n for n in self.workflow.nodes if n.id == self.selected_node), None)
+            if node:
+                worker_id = node.worker_id
+        if not worker_id:
+            workers = self.store.list_workers()
+            worker_id = workers[0].id if workers else ""
+        if not worker_id:
+            self.set_message("请先新增 Worker 再开启对话", error=True)
+            return
+        self.open_chat(worker_id)
+
+    def action_edit_chat_worker(self) -> None:
+        if self.chat_worker_id:
+            try:
+                self.open_worker(self.chat_worker_id)
+            except ValueError as exc:
+                self.set_message(str(exc), error=True)
+
+    def action_edit_selected_worker(self) -> None:
+        if self.workflow and self.selected_node:
+            node = next((n for n in self.workflow.nodes if n.id == self.selected_node), None)
+            if node:
+                try:
+                    self.open_worker(node.worker_id)
+                except ValueError as exc:
+                    self.set_message(str(exc), error=True)
+
+    def action_clear_chat(self) -> None:
+        if not self.chat_worker_id:
+            return
+        if self.chat_busy:
+            self.set_message("对话回复中，请先 /run stop 停止", error=True)
+            return
+        worker = self.store.get_worker(self.chat_worker_id)
+        self.chat_session = ChatSession(new_id(), worker.id, worker.name, worker.model)
+        self._chat_key = ()
+        self.set_message(f"已开启 @{worker.id} 新对话")
+        self.render_chat()
+
+    # ==================== Hub 选择页逻辑 ====================
+    def _hub_selected_key(self) -> str | None:
+        listing = self.root.query_one("#hub-list", OptionList)
+        if listing.highlighted is None or not listing.option_count:
+            return None
+        return listing.get_option_at_index(listing.highlighted).id
+
+    def _set_hub_tab(self, tab: str) -> None:
+        self.hub_tab = tab
+        for name in ("workflows", "workers", "runs"):
+            btn = self.root.query_one(f"#hub-tab-{name}", Button)
+            btn.set_class(name == tab, "active")
+        self.render_hub()
+
+    def _render_hub_footer(self, *, error: bool = False) -> None:
+        hints = {
+            "workflows": (
+                "↑↓ 浏览 · Enter/→ 进入工作台 · n 新建 · e 编辑 · r 运行 · c 复制 · d 删除 · / 筛选"
+            ),
+            "workers": (
+                "↑↓ 浏览 · Enter/→ 开始单聊 · n 新建 · e 配置 · m 刷新模型 · d 删除 · / 筛选"
+            ),
+            "runs": "↑↓ 浏览 · Enter/→ 回放历史运行 · 1/2/3 切标签 · / 筛选",
+        }[self.hub_tab]
+        footer = self.root.query_one("#hub-footer", Static)
+        if error:
+            footer.update(Text(f"⚠ {self.message}", RED))
+        else:
+            footer.update(Text(hints, MUTED))
+
+    def render_hub(self) -> None:
+        if not self.is_mounted:
+            return
+        workers = self.store.list_workers()
+        workflows = self.store.list_workflows()
+        runs = self.store.list_runs(limit=30)
+
+        head = Text()
+        head.append(" ◈ CTflow ", "bold " + ORANGE)
+        head.append(" 选择页 ", BLUE)
+        head.append("  ·  ", LINE)
+        head.append("1 Workflows  2 Workers  3 Runs  ·  → 进入", MUTED)
+        if self.workflow:
+            head.append("   ")
+            head.append(
+                *_link(f"返回当前：{fit(self.workflow.name, 22)} ›", "open_workbench()", BLUE)
+            )
+        self.root.query_one("#masthead", Static).update(head)
+
+        compact_splash = self.size.height < 30 or self.size.width < 92
+        self.root.query_one("#splash-banner", Static).update(
+            render_splash(len(workers), len(workflows), len(runs), compact=compact_splash)
+        )
+
+        self.root.query_one("#hub-tab-workflows", Button).label = f"❖ Workflows ({len(workflows)})"
+        self.root.query_one("#hub-tab-workers", Button).label = f"◉ Workers ({len(workers)})"
+        self.root.query_one("#hub-tab-runs", Button).label = f"◷ Runs ({len(runs)})"
+
+        query = self.hub_query.strip().casefold()
+        listing = self.root.query_one("#hub-list", OptionList)
+        prev_key = self._hub_selected_key()
+        listing.clear_options()
+        list_box = self.root.query_one("#hub-list-box")
+
+        if self.hub_tab == "workflows":
+            list_box.border_title = "工作流列表 · Enter / → 加载"
+            latest_by_flow: dict[str, Run] = {}
+            for item in runs:
+                latest_by_flow.setdefault(item.workflow.id, item)
+            for wf in workflows:
+                haystack = f"{wf.id} {wf.name} {wf.task}".casefold()
+                if query and query not in haystack:
+                    continue
+                is_current = self.workflow is not None and wf.id == self.workflow.id
+                last_run = latest_by_flow.get(wf.id)
+                row = Text()
+                row.append("★ " if is_current else "❖ ", ORANGE if is_current else BLUE)
+                row.append(fit(wf.name, 26), "bold " + TEXT if is_current else TEXT)
+                row.append(f"  ({len(wf.nodes)} 节点)\n", MUTED)
+                row.append(f"  {fit(workflow_summary(wf), 34)}", BLUE)
+                if last_run:
+                    row.append("  ·  ", LINE)
+                    row.append_text(status_text(last_run.status))
+                listing.add_option(Option(row, id=wf.id))
+        elif self.hub_tab == "workers":
+            list_box.border_title = "Worker 角色库 · Enter / → 独立对话"
+            for wk in workers:
+                haystack = f"{wk.id} {wk.name} {wk.model} {wk.base_url} {wk.protocol}".casefold()
+                if query and query not in haystack:
+                    continue
+                ready = bool(wk.base_url.strip() and wk.api_key.strip() and wk.model.strip())
+                row = Text()
+                row.append("● " if ready else "○ ", GREEN if ready else ORANGE)
+                row.append(f"@{wk.id} · {wk.name}", TEXT)
+                row.append(f"  [{wk.protocol}]\n", BLUE)
+                tool_count = len(wk.builtin_tools) + len(wk.mcp_servers)
+                extra_info = f" · {tool_count} 工具" if tool_count else ""
+                model_str = fit(wk.model or "未设模型", 22)
+                host_str = fit(upstream_label(wk.base_url), 22)
+                row.append(f"  {model_str} · {host_str}{extra_info}", MUTED)
+                listing.add_option(Option(row, id=wk.id))
+        else:
+            list_box.border_title = "历史运行 · Enter / → 回放"
+            for item in runs:
+                haystack = f"{item.id} {item.workflow.name} {item.task} {item.status}".casefold()
+                if query and query not in haystack:
+                    continue
+                row = Text()
+                row.append_text(status_text(item.status))
+                row.append(f"  {item.workflow.name}\n", TEXT)
+                stamp = item.created_at[:19].replace("T", " ")
+                row.append(
+                    f"  {stamp} · {item.usage.total_tokens} tok · {elapsed(item)}",
+                    MUTED,
+                )
+                listing.add_option(Option(row, id=item.id))
+
+        if listing.option_count:
+            target_idx = 0
+            if prev_key is not None:
+                for idx in range(listing.option_count):
+                    if listing.get_option_at_index(idx).id == prev_key:
+                        target_idx = idx
+                        break
+            elif self.hub_tab == "workflows" and self.workflow:
+                for idx in range(listing.option_count):
+                    if listing.get_option_at_index(idx).id == self.workflow.id:
+                        target_idx = idx
+                        break
+            listing.highlighted = target_idx
+        self._render_hub_preview()
+        self._render_hub_footer()
+
+    def _render_hub_preview(self) -> None:
+        preview = self.root.query_one("#hub-preview", Pane)
+        key = self._hub_selected_key()
+        if key is None:
+            preview.border_title = "预览"
+            empty_msg = {
+                "workflows": "未找到工作流。按 n 打开可视化工作流构建器新建一个。",
+                "workers": "未找到 Worker。按 n 新建一个可复用 Worker。",
+                "runs": "尚无运行记录。先加载一个工作流并执行 /run。",
+            }[self.hub_tab]
+            preview.show_content(Text(empty_msg, MUTED))
+            return
+
+        width = max(36, preview.content_size.width or 56)
+        if self.hub_tab == "workflows":
+            try:
+                wf = self.store.get_workflow(key)
+            except ValueError:
+                return
+            preview.border_title = f"工作流预览 · {wf.name}"
+            doc = Text()
+            doc.append(f"{wf.name}", "bold " + TEXT)
+            doc.append(f"  ({wf.id})\n", MUTED)
+            doc.append("总任务：", BLUE)
+            doc.append((wf.task or "未填写总任务") + "\n\n", TEXT)
+            doc.append("拓扑结构\n", BLUE)
+            doc.append_text(graph(wf, {}, "", width, 0, interactive=False))
+            doc.append("\n\n节点装配清单\n", BLUE)
+            for node in wf.nodes:
+                deps = ", ".join(node.dependencies) if node.dependencies else "起点"
+                doc.append(f"  {node.id} · {node.label}", TEXT)
+                doc.append(f"  @{node.worker_id}", BLUE)
+                doc.append(f"  ← {deps}\n", MUTED)
+            preview.show_content(doc)
+        elif self.hub_tab == "workers":
+            try:
+                wk = self.store.get_worker(key)
+            except ValueError:
+                return
+            preview.border_title = f"Worker 详情 · @{wk.id}"
+            ready = bool(wk.base_url.strip() and wk.api_key.strip() and wk.model.strip())
+            doc = Text()
+            doc.append(f"@{wk.id} · {wk.name}  ", "bold " + TEXT)
+            doc.append("● 已就绪\n\n" if ready else "○ 连接待配置\n\n", GREEN if ready else ORANGE)
+            doc.append("上游协议：", MUTED)
+            doc.append(f"{wk.protocol}\n", BLUE)
+            doc.append("Base URL：", MUTED)
+            doc.append(f"{wk.base_url or '未填写'}\n", TEXT)
+            doc.append("模型 ID：", MUTED)
+            doc.append(f"{wk.model or '未填写'}\n", BLUE)
+            doc.append("附加参数：", MUTED)
+            doc.append(f"{wk.extra_body or '{}'}\n", ORANGE if wk.extra_body else MUTED)
+            builtin_labels = [
+                BUILTIN_TOOL_CATALOG[t]["label"]
+                for t in wk.builtin_tools
+                if t in BUILTIN_TOOL_CATALOG
+            ]
+            doc.append("内置工具：", MUTED)
+            doc.append(f"{', '.join(builtin_labels) or '无'}\n", GREEN if builtin_labels else MUTED)
+            doc.append("MCP 服务：", MUTED)
+            doc.append(f"{', '.join(wk.mcp_servers) or '无'}\n", TEXT)
+            doc.append("本地技能：", MUTED)
+            doc.append(f"{' '.join('@' + s for s in wk.skills) or '无'}\n\n", TEXT)
+            doc.append("固定上下文\n", BLUE)
+            doc.append(wk.prompt or "（未填写固定提示词）", TEXT if wk.prompt else MUTED)
+            preview.show_content(doc)
+        else:
+            try:
+                run = self.store.get_run(key)
+            except ValueError:
+                return
+            preview.border_title = f"运行快照 · {run.id}"
+            doc = Text()
+            doc.append(f"{run.workflow.name}  ", "bold " + TEXT)
+            doc.append_text(status_text(run.status))
+            doc.append(
+                f"\n时间：{run.created_at[:19].replace('T', ' ')}  ·  "
+                f"Token：{run.usage.total_tokens}  ·  耗时：{elapsed(run)}  ·  "
+                f"{money(run.usage.cost, self.settings.currency)}\n",
+                MUTED,
+            )
+            doc.append(f"任务：{run.task}\n\n", TEXT)
+            for node in run.workflow.nodes:
+                st = run.nodes[node.id]
+                doc.append(f"{node.id} {node.label}  ", TEXT)
+                doc.append_text(status_text(st.status))
+                doc.append(f"  {st.usage.total_tokens} tok\n", MUTED)
+                if st.error:
+                    doc.append(f"  错误：{fit(st.error, 70)}\n", RED)
+                elif st.output:
+                    first = st.output.strip().splitlines()[0]
+                    doc.append(f"  {fit(first, 70)}\n", MUTED)
+            preview.show_content(doc)
+
+    @on(Button.Pressed, "#hub-tab-workflows")
+    def click_hub_workflows(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._set_hub_tab("workflows")
+
+    @on(Button.Pressed, "#hub-tab-workers")
+    def click_hub_workers(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._set_hub_tab("workers")
+
+    @on(Button.Pressed, "#hub-tab-runs")
+    def click_hub_runs(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._set_hub_tab("runs")
+
+    @on(Input.Changed, "#hub-filter")
+    def hub_filter_changed(self, event: Input.Changed) -> None:
+        self.hub_query = event.value
+        self.render_hub()
+
+    @on(Input.Submitted, "#hub-filter")
+    def hub_filter_submit(self) -> None:
+        self._activate_hub_item()
+
+    @on(OptionList.OptionHighlighted, "#hub-list")
+    def hub_list_highlighted(self) -> None:
+        self._render_hub_preview()
+
+    @on(OptionList.OptionSelected, "#hub-list")
+    def hub_list_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self._activate_hub_item(event.option.id)
+
+    def _activate_hub_item(self, key: str | None = None) -> None:
+        selected = key or self._hub_selected_key()
+        if not selected:
+            return
+        try:
+            if self.hub_tab == "workflows":
+                self.load_workflow(selected)
+                self.action_open_workbench()
+            elif self.hub_tab == "workers":
+                self.open_chat(selected)
+            else:
+                self.load_historical_run(selected)
+        except ValueError as exc:
+            self.set_message(str(exc), error=True)
+
+    def load_historical_run(self, run_id: str) -> None:
+        self.require_editable()
+        run = self.store.get_run(run_id)
+        self.workflow = deepcopy(run.workflow)
+        self.view_run = run
+        self.selected_node = run.workflow.nodes[0].id if run.workflow.nodes else ""
+        self.view_name = "run"
+        self.action_open_workbench()
+        self.set_message(f"已加载历史运行 · {run.id} ({run.status})")
+
+    def _hub_delete_selected(self) -> None:
+        key = self._hub_selected_key()
+        if not key:
+            return
+        try:
+            self.require_editable()
+        except ValueError as exc:
+            self.set_message(str(exc), error=True)
+            return
+
+        if self.hub_tab == "workflows":
+            wf = self.store.get_workflow(key)
+
+            def on_confirm_wf(ok: bool | None) -> None:
+                if not ok:
+                    return
+                try:
+                    self.store.delete_workflow(wf.id)
+                    if self.workflow and self.workflow.id == wf.id:
+                        remaining = self.store.list_workflows()
+                        self.workflow = remaining[0] if remaining else None
+                        self.selected_node = (
+                            self.workflow.nodes[0].id
+                            if self.workflow and self.workflow.nodes
+                            else ""
+                        )
+                    self.set_message(f"已删除工作流 · {wf.name}")
+                    self.render_hub()
+                except (ValueError, RuntimeError) as exc:
+                    self.set_message(str(exc), error=True)
+
+            self.push_screen(
+                ConfirmScreen(
+                    "删除工作流", f"确定删除工作流「{wf.name}」({wf.id})？历史运行记录会保留。"
+                ),
+                on_confirm_wf,
+            )
+        elif self.hub_tab == "workers":
+            wk = self.store.get_worker(key)
+
+            def on_confirm_wk(ok: bool | None) -> None:
+                if not ok:
+                    return
+                try:
+                    self.store.delete_worker(wk.id)
+                    self.worker_models.pop(wk.id, None)
+                    self.set_message(f"已删除 Worker · @{wk.id}")
+                    self.render_hub()
+                except (ValueError, RuntimeError) as exc:
+                    self.set_message(str(exc), error=True)
+
+            self.push_screen(
+                ConfirmScreen("删除 Worker", f"确定删除 Worker「{wk.name}」(@{wk.id})？"),
+                on_confirm_wk,
+            )
+
+    def on_key(self, event: events.Key) -> None:
+        if len(self.screen_stack) > 1:
+            return
+        focused = self.focused
+        in_text_input = isinstance(focused, Input)
+
+        if self.page in {"workbench", "chat"}:
+            if event.key == "left" and not in_text_input:
+                event.stop()
+                event.prevent_default()
+                self.action_back_to_hub()
+            return
+
+        # Hub 键盘快捷键：像 Codex / OpenCode 一样全键盘无阻。
+        filter_input = self.root.query_one("#hub-filter", Input)
+        listing = self.root.query_one("#hub-list", OptionList)
+        if filter_input.has_focus:
+            if event.key in {"down", "up"}:
+                listing.focus()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "escape":
+                filter_input.value = ""
+                listing.focus()
+                event.stop()
+                event.prevent_default()
+            return
+
+        key = event.key
+        if key == "right":
+            event.stop()
+            event.prevent_default()
+            self._activate_hub_item()
+        elif key == "1":
+            event.stop()
+            self._set_hub_tab("workflows")
+        elif key == "2":
+            event.stop()
+            self._set_hub_tab("workers")
+        elif key == "3":
+            event.stop()
+            self._set_hub_tab("runs")
+        elif key == "tab":
+            event.stop()
+            event.prevent_default()
+            order = ["workflows", "workers", "runs"]
+            self._set_hub_tab(order[(order.index(self.hub_tab) + 1) % len(order)])
+        elif key == "slash":
+            event.stop()
+            event.prevent_default()
+            filter_input.focus()
+        elif key == "n":
+            event.stop()
+            try:
+                if self.hub_tab == "workers":
+                    self.open_worker("new")
+                else:
+                    self.open_flow_editor(new=True)
+            except ValueError as exc:
+                self.set_message(str(exc), error=True)
+        elif key == "e":
+            event.stop()
+            selected = self._hub_selected_key()
+            if not selected:
+                return
+            try:
+                if self.hub_tab == "workflows":
+                    self.load_workflow(selected)
+                    self.open_flow_editor()
+                elif self.hub_tab == "workers":
+                    self.open_worker(selected)
+            except ValueError as exc:
+                self.set_message(str(exc), error=True)
+        elif key == "r" and self.hub_tab == "workflows":
+            event.stop()
+            selected = self._hub_selected_key()
+            if selected:
+                try:
+                    self.load_workflow(selected)
+                    self.action_open_workbench()
+                    asyncio.create_task(self.action_run())
+                except ValueError as exc:
+                    self.set_message(str(exc), error=True)
+        elif key == "c":
+            event.stop()
+            selected = self._hub_selected_key()
+            if not selected:
+                return
+            if self.hub_tab == "workers":
+                self.open_chat(selected)
+            elif self.hub_tab == "workflows":
+                try:
+                    self.require_editable()
+                    cloned = deepcopy(self.store.get_workflow(selected))
+                    cloned.id = new_id()
+                    cloned.name = f"{cloned.name} (副本)"
+                    self.save_workflow(cloned, switch_to_workbench=False)
+                    self.render_hub()
+                except ValueError as exc:
+                    self.set_message(str(exc), error=True)
+        elif key == "m" and self.hub_tab == "workers":
+            event.stop()
+            selected = self._hub_selected_key()
+            if selected:
+                self.open_models(selected)
+        elif key in {"d", "delete"}:
+            event.stop()
+            self._hub_delete_selected()
+
+    # ==================== 工作流与 Worker 编排管理 ====================
+    def save_workflow(self, workflow: Workflow, *, switch_to_workbench: bool = True) -> None:
         self.require_editable()
         workflow.source = to_mermaid(workflow)
         self.store.save_workflow(workflow)
@@ -606,7 +902,12 @@ class CTFlowApp(App[None]):
         if self.selected_node not in {n.id for n in workflow.nodes}:
             self.selected_node = workflow.nodes[0].id
         self.set_message(f"已保存 · {workflow.name}")
-        self.render_workbench()
+        if switch_to_workbench:
+            self.page = "workbench"
+            self._apply_page_visibility()
+            self.render_workbench()
+        else:
+            self.render_current()
 
     def load_workflow(self, key: str | None) -> None:
         if key is None:
@@ -616,7 +917,10 @@ class CTFlowApp(App[None]):
         self.view_run = None
         self.selected_node, self.view_name = self.workflow.nodes[0].id, "flow"
         self.set_message(f"已加载 · {self.workflow.name}")
-        self.render_workbench()
+        if self.page != "hub":
+            self.page = "workbench"
+            self._apply_page_visibility()
+            self.render_workbench()
 
     def open_worker(self, key: str) -> None:
         self.require_editable()
@@ -634,9 +938,15 @@ class CTFlowApp(App[None]):
         if worker is not None:
             self.store.save_worker(worker)
             self.worker_models.pop(worker.id, None)
-            self.view_run, self.view_name = None, "flow"
+            self.view_run = None
+            if self.page == "workbench":
+                self.view_name = "flow"
+            if self.chat_session and self.chat_session.worker_id == worker.id:
+                self.chat_session.worker_name = worker.name
+                self.chat_session.model = worker.model
+                self._chat_key = ()
             self.set_message(f"Worker 已保存 · @{worker.id} {worker.name}")
-            self.render_workbench()
+            self.render_current()
 
     def action_select_node(self, node_id: str) -> None:
         try:
@@ -667,12 +977,196 @@ class CTFlowApp(App[None]):
         if not workers:
             raise ValueError("请先用 /worker new 新增 Worker")
         workflow = (
-            Workflow(new_id(), name or "新工作流", "", [Node("A", "任务", workers[0].id)])
+            Workflow(new_id(), name or "新工作流", "", [Node("A", "核心任务", workers[0].id)])
             if new
             else deepcopy(self.current_workflow())
         )
-        self.push_screen(FlowEditor(workflow, workers), self.flow_saved)
+        self.push_screen(FlowEditor(workflow, workers, is_new=new), self.flow_saved)
 
+    def _open_flow_picker(self) -> None:
+        self.push_screen(
+            PickerScreen(
+                "工作流 · 选择并加载",
+                [
+                    (w.id, Text(f"❖ {w.name}\n  {workflow_summary(w)} · {w.id}", BLUE))
+                    for w in self.store.list_workflows()
+                ],
+                "/flow new 可视化新建 · /flow edit 编辑 · /flow save 名称 另存",
+            ),
+            self.load_workflow,
+        )
+
+    # ==================== 单 Worker 独立多轮对话 ====================
+    def open_chat(self, worker_id: str) -> None:
+        self.require_editable()
+        worker = self.store.get_worker(worker_id.lstrip("@"))
+        self.chat_worker_id = worker.id
+        if self.chat_session is None or self.chat_session.worker_id != worker.id:
+            restored = load_latest_chat(self.settings.data_dir, worker.id)
+            self.chat_session = restored or ChatSession(
+                new_id(), worker.id, worker.name, worker.model
+            )
+        self.page = "chat"
+        self._chat_key = ()
+        self._apply_page_visibility()
+        prompt = self.root.query_one("#prompt", Input)
+        prompt.placeholder = (
+            f"向 @{worker.id} ({worker.name}) 发消息，或输入 /（空框按 ← 返回选择页）"
+        )
+        self.set_message(f"单 Worker 对话 · @{worker.id} · /clear 清空 · /worker 配置 · ← 返回")
+        self.render_chat()
+        prompt.focus()
+
+    async def send_chat_message(self, text: str) -> None:
+        if self.chat_busy:
+            self.set_message("正在回复中，请先 /run stop 停止", error=True)
+            return
+        if not self.chat_worker_id:
+            self.set_message("请先选择 Worker", error=True)
+            return
+        worker = self.store.get_worker(self.chat_worker_id)
+        if self.chat_session is None or self.chat_session.worker_id != worker.id:
+            self.chat_session = ChatSession(new_id(), worker.id, worker.name, worker.model)
+        self.chat_busy = True
+        self.set_message(f"@{worker.id} 思考中… · /run stop 停止")
+        self._chat_task = asyncio.create_task(self._execute_chat_turn(worker, text))
+        self.render_chat()
+
+    async def _execute_chat_turn(self, worker: Worker, text: str) -> None:
+        assert self.chat_session is not None
+        try:
+            turn = await run_chat_turn(
+                self.chat_session,
+                worker,
+                self.settings,
+                text,
+                client=self.client,
+                on_update=self._on_chat_update,
+            )
+            if not self._shutting_down:
+                if turn.status == "success":
+                    total_tok = self.chat_session.usage.total_tokens
+                    self.set_message(
+                        f"回复完成 · 本轮 {turn.usage.total_tokens} Token · 累计 {total_tok} Token"
+                    )
+                else:
+                    self.set_message(turn.error or f"对话状态：{turn.status}", error=True)
+        except asyncio.CancelledError:
+            if not self._shutting_down:
+                self.set_message("对话已停止")
+        except Exception as exc:
+            if not self._shutting_down:
+                self.set_message(self.redact(str(exc)), error=True)
+        finally:
+            self.chat_busy = False
+            if not self._shutting_down:
+                self.render_chat()
+
+    def _on_chat_update(self) -> None:
+        if not self._shutting_down and self.page == "chat":
+            self.render_chat()
+
+    def render_chat(self) -> None:
+        if not self.is_mounted or not self.chat_worker_id:
+            return
+        try:
+            worker = self.store.get_worker(self.chat_worker_id)
+        except ValueError:
+            self.action_back_to_hub()
+            return
+        session = self.chat_session or ChatSession(new_id(), worker.id, worker.name, worker.model)
+        usage = session.usage
+
+        head = Text()
+        head.append(*_link(" ‹ 列表 ", "back_to_hub()", ORANGE, bold=True))
+        head.append(" │ ", LINE)
+        head.append(f"💬 @{worker.id} · {worker.name}", "bold " + TEXT)
+        head.append(f"  [{fit(worker.model, 24)} · {worker.protocol}]", BLUE)
+        head.append("   ")
+        head.append(*_link("[配置]", "edit_chat_worker()", MUTED))
+        head.append(" ")
+        head.append(*_link("[新对话]", "clear_chat()", MUTED))
+        if self.workflow:
+            head.append(" ")
+            head.append(*_link("[工作台]", "open_workbench()", GREEN))
+        cost_text = money(usage.cost, self.settings.currency)
+        head.append(
+            f"   {len(session.turns)} 轮 · {usage.total_tokens} tok · {cost_text}",
+            MUTED,
+        )
+        self.root.query_one("#masthead", Static).update(head)
+
+        pane = self.root.query_one("#chat-pane", Pane)
+        tools_summary = []
+        if worker.builtin_tools:
+            tools_summary.append(f"内置:{','.join(worker.builtin_tools)}")
+        if worker.mcp_servers:
+            tools_summary.append(f"MCP:{','.join(worker.mcp_servers)}")
+        if worker.skills:
+            tools_summary.append(f"技能:{','.join('@' + s for s in worker.skills)}")
+        pane.border_title = f"单 Worker 对话 · {upstream_label(worker.base_url)}" + (
+            f" · {' | '.join(tools_summary)}" if tools_summary else ""
+        )
+
+        chat_key = (
+            session.id,
+            worker.model,
+            len(session.turns),
+            tuple(
+                (t.status, t.assistant, t.error, len(t.tool_steps), t.usage.total_tokens)
+                for t in session.turns
+            ),
+            self.frame if self.chat_busy else 0,
+        )
+        if chat_key == self._chat_key:
+            return
+        self._chat_key = chat_key
+
+        if not session.turns:
+            intro = Text()
+            intro.append(f"◉ @{worker.id} · {worker.name}\n", "bold " + BLUE)
+            host = upstream_label(worker.base_url)
+            intro.append(
+                f"模型：{worker.model}  ·  协议：{worker.protocol}  ·  上游：{host}\n",
+                MUTED,
+            )
+            if tools_summary:
+                intro.append(f"已装配能力：{' · '.join(tools_summary)}\n", GREEN)
+            else:
+                intro.append(
+                    "未开启工具：输入 /worker 可勾选内置文件/搜索工具或 MCP 实现多步调用。\n",
+                    ORANGE,
+                )
+            if worker.prompt:
+                intro.append(f"\n固定上下文：{fit(worker.prompt, 240)}\n", MUTED)
+            intro.append("\n直接输入问题并回车即可开始多轮对话。", TEXT)
+            pane.show_content(intro)
+            return
+
+        sections: list[str] = []
+        for idx, turn in enumerate(session.turns, start=1):
+            sections.append(f"### 你 · 第 {idx} 轮\n\n{turn.user}")
+            tool_md = format_tool_steps_markdown(turn.tool_steps)
+            status_badge = {
+                "running": f"◉ 生成中{'.' * (self.frame % 4 + 1)}",
+                "success": f"✓ {turn.usage.total_tokens} tok",
+                "failed": "✕ 失败",
+                "stopped": "■ 已停止",
+            }.get(turn.status, turn.status)
+            body_parts = [f"### @{worker.id} · {worker.name}（{status_badge}）"]
+            if tool_md:
+                body_parts.append(tool_md)
+            if turn.assistant:
+                body_parts.append(turn.assistant)
+            elif turn.status == "running":
+                body_parts.append("等待模型输出…")
+            if turn.error:
+                body_parts.append(f"**错误**：{turn.error}")
+            sections.append("\n\n".join(body_parts))
+
+        pane.show_content(Markdown("\n\n---\n\n".join(sections)), follow=self.chat_busy)
+
+    # ==================== 工作流执行引擎交互 ====================
     async def action_run(self) -> None:
         if self.busy:
             self.set_message("已有运行 · /run stop 停止", error=True)
@@ -685,6 +1179,8 @@ class CTFlowApp(App[None]):
             self.busy = False
             self.set_message(str(exc), error=True)
             return
+        self.page = "workbench"
+        self._apply_page_visibility()
         self.view_name = "run"
         self._run_task = asyncio.create_task(self.execute_run(self.view_run))
         self.set_message("运行中 · /run stop 停止")
@@ -709,20 +1205,24 @@ class CTFlowApp(App[None]):
         finally:
             self.busy = False
             if not self._shutting_down:
-                self.render_workbench()
+                self.render_current()
 
     def action_stop(self) -> None:
         if self.busy:
             self._stop_requested = True
             self.engine.stop()
-            self.set_message("正在停止…")
+            self.set_message("正在停止工作流…")
+        elif self.chat_busy and self._chat_task and not self._chat_task.done():
+            self._chat_task.cancel()
+            self.set_message("正在停止单聊回复…")
         else:
             self.set_message("当前没有运行")
 
     def on_engine_event(self, event: dict) -> None:
-        if not self._shutting_down:
+        if not self._shutting_down and self.page == "workbench":
             self.render_workbench()
 
+    # ==================== 模型刷新（净化：绝不混入旧上游模型） ====================
     async def fetch_models(self, worker: Worker) -> list[str]:
         worker.require_api()
         if self.client is not None:
@@ -730,7 +1230,7 @@ class CTFlowApp(App[None]):
         else:
             async with ModelClient(self.settings, worker) as client:
                 remote = await client.list_models()
-        return list(dict.fromkeys([worker.model, *remote]))
+        return list(dict.fromkeys(remote))
 
     def open_models(self, key: str | None) -> None:
         if key is None:
@@ -744,7 +1244,8 @@ class CTFlowApp(App[None]):
         try:
             models = await self.fetch_models(worker)
             current = self.store.get_worker(worker.id)
-            if (current.base_url, current.api_key, current.extra_body) != (
+            if (current.protocol, current.base_url, current.api_key, current.extra_body) != (
+                worker.protocol,
                 worker.base_url,
                 worker.api_key,
                 worker.extra_body,
@@ -769,7 +1270,7 @@ class CTFlowApp(App[None]):
     async def on_unmount(self) -> None:
         self._shutting_down = True
         self.engine.stop()
-        tasks = [t for t in (self._run_task, self._model_task) if t is not None]
+        tasks = [t for t in (self._run_task, self._model_task, self._chat_task) if t is not None]
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -783,57 +1284,120 @@ class CTFlowApp(App[None]):
                     state.status, state.finished_at = "stopped", self.view_run.finished_at
             self.store.save_run(self.view_run)
         self.busy = False
+        self.chat_busy = False
 
+    # ==================== 斜杠命令与输入处理 ====================
     async def execute_command(self, text: str) -> None:
         text = text.strip()
         if not text:
             return
         try:
             if not text.startswith("/"):
+                if self.page == "chat":
+                    await self.send_chat_message(text)
+                    return
                 self.require_editable()
                 workflow = deepcopy(self.current_workflow())
                 workflow.task = text
                 self.save_workflow(workflow)
                 return
+
             command, _, arguments = text.partition(" ")
             arguments = arguments.strip()
-            if command == "/run":
+            if command == "/hub":
+                self.action_back_to_hub()
+            elif command == "/chat":
+                if arguments:
+                    self.open_chat(arguments)
+                elif self.page == "chat" and self.chat_worker_id:
+                    self.open_chat(self.chat_worker_id)
+                else:
+                    workers = self.store.list_workers()
+                    if not workers:
+                        raise ValueError("请先 /worker new 新增 Worker")
+                    selected_worker = None
+                    if self.workflow and self.selected_node:
+                        node = next(
+                            (n for n in self.workflow.nodes if n.id == self.selected_node), None
+                        )
+                        selected_worker = node.worker_id if node else None
+                    if selected_worker:
+                        self.open_chat(selected_worker)
+                    else:
+                        self.push_screen(
+                            PickerScreen(
+                                "单 Worker 对话 · 选择角色",
+                                [
+                                    (
+                                        w.id,
+                                        Text(
+                                            f"@{w.id}  {w.name}\n  {w.model} · {w.protocol}", BLUE
+                                        ),
+                                    )
+                                    for w in workers
+                                ],
+                                "选择一个 Worker 开启多轮独立对话",
+                            ),
+                            lambda key: self.open_chat(key) if key else None,
+                        )
+            elif command == "/clear":
+                if self.page == "chat":
+                    self.action_clear_chat()
+                else:
+                    raise ValueError("/clear 仅用于单 Worker 对话模式")
+            elif command == "/run":
                 if arguments == "stop":
                     self.action_stop()
                 elif not arguments:
                     await self.action_run()
                 else:
                     raise ValueError("用法：/run 或 /run stop")
+            elif command == "/stop":
+                self.action_stop()
             elif command == "/models":
-                selected = (
-                    next((n for n in self.workflow.nodes if n.id == self.selected_node), None)
-                    if self.workflow
-                    else None
-                )
-                if arguments or selected:
-                    self.open_models(arguments or selected.worker_id)
+                if arguments:
+                    self.open_models(arguments)
+                elif self.page == "chat" and self.chat_worker_id:
+                    self.open_models(self.chat_worker_id)
                 else:
-                    self.push_screen(
-                        PickerScreen(
-                            "模型 · 选择 Worker 连接",
-                            [
-                                (w.id, Text(f"@{w.id}  {w.name}", BLUE))
-                                for w in self.store.list_workers()
-                            ],
-                            "/models <worker_id> 刷新该 Worker 的模型",
-                        ),
-                        self.open_models,
+                    selected = (
+                        next((n for n in self.workflow.nodes if n.id == self.selected_node), None)
+                        if self.workflow
+                        else None
                     )
+                    if selected:
+                        self.open_models(selected.worker_id)
+                    else:
+                        self.push_screen(
+                            PickerScreen(
+                                "模型 · 选择 Worker 连接",
+                                [
+                                    (w.id, Text(f"@{w.id}  {w.name}", BLUE))
+                                    for w in self.store.list_workers()
+                                ],
+                                "/models <worker_id> 刷新该 Worker 的模型",
+                            ),
+                            self.open_models,
+                        )
             elif command == "/worker":
                 self.require_editable()
                 if arguments:
                     self.open_worker(arguments)
+                elif self.page == "chat" and self.chat_worker_id:
+                    self.open_worker(self.chat_worker_id)
                 else:
                     self.push_screen(
                         PickerScreen(
                             "Worker 配置",
                             [
-                                (w.id, Text(f"@{w.id}  {w.name}\n{w.model}", BLUE))
+                                (
+                                    w.id,
+                                    Text(
+                                        f"@{w.id}  {w.name}\n"
+                                        f"  {w.model} · {upstream_label(w.base_url)}",
+                                        BLUE,
+                                    ),
+                                )
                                 for w in self.store.list_workers()
                             ],
                             "/worker new 新增 · /worker <id> 编辑",
@@ -841,9 +1405,12 @@ class CTFlowApp(App[None]):
                         lambda key: self.open_worker(key) if key else None,
                     )
             elif command == "/node":
-                if not arguments:
-                    raise ValueError("用法：/node <id>")
-                self.action_select_node(arguments)
+                if arguments == "new":
+                    self.action_add_node_quick()
+                elif not arguments:
+                    raise ValueError("用法：/node <id> 或 /node new")
+                else:
+                    self.action_select_node(arguments)
             elif command == "/flow":
                 self.require_editable()
                 action, _, value = arguments.partition(" ")
@@ -859,22 +1426,20 @@ class CTFlowApp(App[None]):
                 elif action:
                     self.load_workflow(arguments)
                 else:
-                    self.push_screen(
-                        PickerScreen(
-                            "工作流 · 选择后加载",
-                            [
-                                (w.id, Text(f"{w.name}\n{len(w.nodes)} 节点 · {w.id}", BLUE))
-                                for w in self.store.list_workflows()
-                            ],
-                            "/flow new 新建 · /flow edit 编辑 · /flow save 名称 另存",
-                        ),
-                        self.load_workflow,
-                    )
+                    self._open_flow_picker()
             elif command == "/view" and arguments in {"flow", "run", "result"}:
-                self.view_name = arguments
-                self.render_workbench()
+                self.action_switch_view(arguments)
             elif command == "/export":
-                self.export_result()
+                if self.page == "chat" and self.chat_session and self.chat_session.turns:
+                    self.last_export = export_chat_markdown(
+                        self.store.data_dir,
+                        self.chat_session,
+                        self.settings.currency,
+                        self.redact,
+                    )
+                    self.set_message(f"已导出对话 · {self.last_export}")
+                else:
+                    self.export_result()
             else:
                 raise ValueError("未知命令 · 输入 / 查看命令")
         except (ValueError, OSError, RuntimeError) as exc:
@@ -906,6 +1471,8 @@ class CTFlowApp(App[None]):
         choices = list(COMMANDS)
         if text.startswith("/worker "):
             choices.extend((f"/worker {w.id}", w.name) for w in self.store.list_workers())
+        if text.startswith("/chat "):
+            choices.extend((f"/chat {w.id}", w.name) for w in self.store.list_workers())
         if text.startswith("/flow "):
             choices.extend((f"/flow {w.id}", w.name) for w in self.store.list_workflows())
         if text.startswith("/node ") and self.workflow:
@@ -972,14 +1539,22 @@ class CTFlowApp(App[None]):
             self.root.query_one("#prompt", Input).focus()
 
     def action_commands(self) -> None:
+        if self.page == "hub":
+            self.root.query_one("#hub-filter", Input).focus()
+            return
         prompt = self.root.query_one("#prompt", Input)
         prompt.value = "/"
         prompt.focus()
 
     def action_escape(self) -> None:
+        if self.page == "hub":
+            if self.workflow:
+                self.action_open_workbench()
+            return
         self.root.query_one("#command-menu").display = False
         self.root.query_one("#prompt", Input).focus()
 
+    # ==================== Workflow 工作台渲染 ====================
     def render_workbench(self) -> None:
         if not self.is_mounted:
             return
@@ -987,32 +1562,75 @@ class CTFlowApp(App[None]):
         workflow = run.workflow if run and self.view_name != "flow" else self.workflow
         states = run.nodes if run else {}
         workers = run.workers if run else {w.id: w for w in self.store.list_workers()}
-        head = Text(" ctflow ", "bold " + ORANGE)
-        head.append(" 03 / FLUX", BLUE)
-        head.append(f"   {workflow.name if workflow else '新工作台'}", MUTED)
+
+        head = Text()
+        head.append(*_link(" ‹ 列表 ", "back_to_hub()", ORANGE, bold=True))
+        head.append(" │ ", LINE)
+        flow_title = f"❖ {fit(workflow.name, 24) if workflow else '新工作台'} ▾"
+        head.append(*_link(flow_title, "quick_flow_picker()", TEXT, bold=True))
+        head.append("  ")
+        for key, title in (("flow", "编排"), ("run", "执行"), ("result", "结果")):
+            active = self.view_name == key
+            head.append(
+                *_link(
+                    f"[{title}]",
+                    f"switch_view('{key}')",
+                    BLUE if active else MUTED,
+                    bold=active,
+                )
+            )
+            head.append(" ")
+        head.append(*_link("[单聊]", "open_chat_current()", GREEN))
         if run:
-            head.append(f"   {run.status} · {run.usage.total_tokens} Token · {elapsed(run)}", BLUE)
+            done_count = sum(1 for item in run.nodes.values() if item.status == "success")
+            head.append(
+                f"  ·  {run.status} {done_count}/{len(run.nodes)} · "
+                f"{run.usage.total_tokens} tok · {elapsed(run)}",
+                BLUE,
+            )
         self.root.query_one("#masthead", Static).update(head)
+
         map_pane = self.root.query_one("#map-pane", Pane)
-        map_pane.border_title = "DAG · 点击节点装配 Worker"
+        map_pane.border_title = "DAG 拓扑 · 点击节点装配 Worker"
+        # 切换页面首帧尚未完成布局时，用终端宽度估算画布可用列数，避免退化为窄列截断。
+        sidebar_reserved = 30 if self.size.width < 104 else 40
+        canvas_width = (
+            map_pane.content_size.width
+            if map_pane.content_size.width > 0
+            else max(20, self.size.width - sidebar_reserved)
+        )
         drawing = (
             graph(
                 workflow,
                 states,
                 self.selected_node,
-                max(20, map_pane.content_size.width),
+                max(20, canvas_width),
                 self.frame,
             )
             if workflow and workflow.nodes
-            else Text("/worker new 配置 Worker → /flow new 创建工作流", MUTED)
+            else Text("/worker new 配置 Worker → /flow new 可视化创建工作流", MUTED)
         )
         # 多路并行时给画布足够行数，同时保留正文与底部输入区。
         map_pane.styles.height = (
-            max(13, min(drawing.plain.count("\n") + 3, self.size.height - 12))
+            max(13, min(drawing.plain.count("\n") + 3, self.size.height - 13))
             if self.size.height >= 28
             else 9
         )
         map_pane.show_content(drawing)
+
+        sidebar = self.root.query_one("#sidebar")
+        sidebar.border_title = f"节点 ({len(workflow.nodes) if workflow else 0})"
+        actions_line = Text()
+        actions_line.append(*_link("+节点", "add_node_quick()", BLUE))
+        actions_line.append(" · ", LINE)
+        actions_line.append(*_link("✎编排", "edit_flow_quick()", TEXT))
+        actions_line.append(" · ", LINE)
+        if self.busy:
+            actions_line.append(*_link("■停止", "toggle_run()", RED, bold=True))
+        else:
+            actions_line.append(*_link("▶运行", "toggle_run()", GREEN, bold=True))
+        self.root.query_one("#sidebar-actions", Static).update(actions_line)
+
         key = (
             tuple(
                 (
@@ -1032,11 +1650,12 @@ class CTFlowApp(App[None]):
             self._cards_key = key
             cards.clear_options()
             for node in workflow.nodes if workflow else []:
-                label = Text(f"{node.id}  {node.label}\n", TEXT)
+                st = states.get(node.id)
+                label = Text(f"{node.id}  {fit(node.label, 20)}\n", TEXT)
                 label.append(f"@{node.worker_id}  ", MUTED)
-                label.append_text(
-                    status_text(states[node.id].status if node.id in states else "waiting")
-                )
+                label.append_text(status_text(st.status if st else "waiting"))
+                if st and st.usage.total_tokens:
+                    label.append(f" · {st.usage.total_tokens}t", MUTED)
                 label.append("\n")
                 cards.add_option(Option(label, id=node.id))
         if (
@@ -1047,43 +1666,70 @@ class CTFlowApp(App[None]):
             cards.highlighted = next(
                 i for i, n in enumerate(workflow.nodes) if n.id == self.selected_node
             )
+
         selected = (
             next((n for n in workflow.nodes if n.id == self.selected_node), None)
             if workflow
             else None
         )
         worker = workers.get(selected.worker_id) if selected else None
-        hint = (
-            f"@{worker.id} · {worker.name}\n{fit(worker.model, 28)}\n"
-            f"{' '.join('@' + s for s in worker.skills) or '未选技能'} · "
-            f"MCP {', '.join(worker.mcp_servers) or '无'}\n\n"
-            "/worker 配置\n/flow edit 编辑图"
-            if worker
-            else "/worker new 新增\n/flow new 创建图"
-        )
-        self.root.query_one("#assembly-hint", Static).update(Text(hint, MUTED))
+        if worker:
+            hint_doc = Text()
+            hint_doc.append(f"@{worker.id} · {worker.name}\n", TEXT)
+            hint_doc.append(f"{fit(worker.model, 28)} · {worker.protocol}\n", BLUE)
+            tool_cnt = len(worker.builtin_tools) + len(worker.mcp_servers)
+            hint_doc.append(
+                f"工具 {tool_cnt} · 技能 {len(worker.skills)}\n",
+                GREEN if tool_cnt else MUTED,
+            )
+            hint_doc.append(*_link("⚙ 配置 Worker", "edit_selected_worker()", BLUE))
+            hint_doc.append("  ", MUTED)
+            hint_doc.append(*_link("💬 单聊", "open_chat_current()", GREEN))
+            self.root.query_one("#assembly-hint", Static).update(hint_doc)
+        else:
+            self.root.query_one("#assembly-hint", Static).update(
+                Text("/worker new 新增\n/flow new 可视化创建", MUTED)
+            )
+
         reading = self.root.query_one("#reading-pane", Pane)
         reading.border_title = {
-            "flow": "编排 · 总任务",
-            "run": "执行 · 节点输出",
-            "result": "结果",
+            "flow": "编排 · 总任务与节点说明",
+            "run": "执行 · 流式输出与工具步骤",
+            "result": "结果汇总",
         }[self.view_name]
         output_key = (
             self.view_name,
             self.selected_node,
             workflow.task if workflow else "",
+            selected.task if selected else "",
             tuple(
-                (k, s.output, s.error, s.status, s.usage.total_tokens) for k, s in states.items()
+                (k, s.output, s.error, s.status, s.usage.total_tokens, len(s.logs))
+                for k, s in states.items()
             ),
         )
         if output_key != self._reading_key:
             self._reading_key = output_key
             if self.view_name == "flow":
-                content = (
-                    Text(workflow.task or "输入目标并回车保存总任务，再用 /run 执行。", TEXT)
-                    if workflow
-                    else Text("先配置 Worker，再创建工作流。", MUTED)
-                )
+                if workflow:
+                    flow_doc = Text()
+                    flow_doc.append("总任务\n", "bold " + BLUE)
+                    flow_doc.append(
+                        (workflow.task or "在下方直接输入目标并回车保存总任务，再用 /run 执行。")
+                        + "\n",
+                        TEXT,
+                    )
+                    if selected:
+                        deps = ", ".join(selected.dependencies) if selected.dependencies else "起点"
+                        flow_doc.append(
+                            f"\n当前节点：{selected.id} · {selected.label}"
+                            f"（@{selected.worker_id} · 上游：{deps}）\n",
+                            ORANGE,
+                        )
+                        if selected.task:
+                            flow_doc.append(selected.task, MUTED)
+                    content: object = flow_doc
+                else:
+                    content = Text("先配置 Worker，再可视化创建工作流（按 ← 打开选择页）。", MUTED)
             elif run and self.view_name == "result":
                 parents = {p for n in run.workflow.nodes for p in n.dependencies}
                 content = Markdown(
@@ -1096,11 +1742,18 @@ class CTFlowApp(App[None]):
                 )
             elif run and self.selected_node in run.nodes:
                 state = run.nodes[self.selected_node]
-                content = Markdown(
-                    f"{state.status} · {state.usage.total_tokens} Token · "
-                    f"{elapsed(state)}\n\n"
-                    f"{state.output or '等待模型输出…'}\n\n{state.error}"
-                )
+                tool_steps = extract_tool_steps(state.logs)
+                parts = [
+                    f"**{state.status}** · {state.usage.total_tokens} Token · "
+                    f"{elapsed(state)} · {money(state.usage.cost, self.settings.currency)}"
+                ]
+                tool_md = format_tool_steps_markdown(tool_steps)
+                if tool_md:
+                    parts.append(tool_md)
+                parts.append(state.output or "等待模型输出…")
+                if state.error:
+                    parts.append(f"**错误**：{state.error}")
+                content = Markdown("\n\n".join(parts))
             else:
-                content = Text("当前工作流还没有运行结果 · /run", MUTED)
+                content = Text("当前工作流还没有运行结果 · 输入 /run 或点击右侧 ▶运行", MUTED)
             reading.show_content(content, follow=self.busy)

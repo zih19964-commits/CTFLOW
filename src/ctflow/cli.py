@@ -102,9 +102,10 @@ async def execute_cli(args: argparse.Namespace, store: Store, settings: Settings
         targets = [worker] if worker else store.list_workers()
         for target in targets:
             print(
-                f"Worker {target.id} · {target.model} · "
+                f"Worker {target.id} · {target.model} ({target.protocol}) · "
                 f"接口：{'已填写' if target.base_url else '待配置'} · "
                 f"API Key：{'已填写' if target.api_key else '待配置'} · "
+                f"内置工具：{', '.join(target.builtin_tools) or '无'} · "
                 f"MCP：{', '.join(target.mcp_servers) or '无'}"
             )
         if args.live:
@@ -170,7 +171,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             if workflow and args.command == "run" and args.task is not None:
                 workflow.task = args.task
-            CTFlowApp(store, settings, workflow=workflow, auto_run=args.command == "run").run()
+            CTFlowApp(
+                store,
+                settings,
+                workflow=workflow,
+                auto_run=args.command == "run",
+                start_in_hub=args.command is None,
+            ).run()
             return 0
         if args.command == "list":
             entries = getattr(store, f"list_{args.kind}")()

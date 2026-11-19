@@ -115,7 +115,7 @@ async def test_graph_click_assembly_and_small_modal(workbench, size):
     store, settings, workflow = workbench
     app = CTFlowApp(store, settings, workflow)
     async with app.run_test(size=size) as pilot:
-        assert not app.query(Button)
+        assert not app.root.query_one("#workbench-view").query(Button)
         canvas = app.root.query_one("#map-pane Static")
         assert not canvas.styles.link_style.underline
         assert not canvas.styles.link_style_hover.underline
@@ -143,7 +143,7 @@ async def test_node_invalid_dependencies_and_close_discards(workbench):
     app = CTFlowApp(store, settings, workflow)
     async with app.run_test(size=(80, 24)) as pilot:
         await graph_click(pilot, app)
-        app.screen.query_one("#field-deps", Input).value = "B"
+        app.screen.query_one("#field-deps-list", SelectionList).select("B")
         await pilot.press("ctrl+s")
         await pilot.pause()
         assert isinstance(app.screen, NodeScreen)
@@ -163,9 +163,9 @@ async def test_worker_models_arbitrary_context_skills_and_new(workbench):
         await app._model_task
         await pilot.pause()
         assert client.model_calls == 1
-        assert "provider/custom-model" in app.worker_models["writer"]
+        assert app.worker_models["writer"] == ["remote-a", "provider/custom-model"]
         assert isinstance(app.screen, PickerScreen)
-        assert app.screen.query_one("#picker-options", OptionList).option_count == 3
+        assert app.screen.query_one("#picker-options", OptionList).option_count == 2
         await pilot.press("escape")
         await pilot.pause()
         await command(pilot, app, "/worker writer")
@@ -244,6 +244,8 @@ async def test_flow_switch_autosave_source_preserves_tasks_and_restart(workbench
         assert isinstance(app.screen, FlowEditor)
         app.screen.query_one("#field-name", Input).value = "第一套已改名"
         app.screen.query_one("#field-task", TextArea).load_text("表单保存的总任务")
+        app.screen._switch_mode("source")
+        await pilot.pause()
         app.screen.query_one("#field-source", TextArea).load_text(
             'flowchart TD\nA["改名研究 @writer"]\nB["汇总 @reviewer"]\nA --> B'
         )
@@ -288,6 +290,8 @@ async def test_invalid_flow_stays_open_and_escape_discards(workbench):
     app = CTFlowApp(store, settings, workflow)
     async with app.run_test(size=(80, 24)) as pilot:
         await command(pilot, app, "/flow edit")
+        app.screen._switch_mode("source")
+        await pilot.pause()
         app.screen.query_one("#field-source", TextArea).load_text(
             'flowchart TD\nA["未知 @missing"]'
         )
@@ -390,8 +394,11 @@ async def test_commands_keyboard_suggestions_and_empty_store(tmp_path):
             await pilot.press("ctrl+p")
             await pilot.pause()
             assert app.query_one("#command-menu").display
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/worker"
+            await pilot.pause()
             await pilot.press("down", "tab")
-            assert app.query_one("#prompt", Input).value == "/worker new"
+            assert prompt.value == "/worker new"
             await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, WorkerScreen)
@@ -552,7 +559,7 @@ async def test_composer_click_focus_text_selection_and_steady_cursor(workbench):
     async with app.run_test(size=(100, 30)) as pilot:
         prompt = app.root.query_one("#prompt", Input)
         app.root.query_one("#node-cards").focus()
-        assert await pilot.click("#composer", offset=(10, 2))
+        assert await pilot.click("#input-meta", offset=(2, 0))
         await pilot.pause()
         assert prompt.has_focus
         assert not prompt.cursor_blink
@@ -837,10 +844,10 @@ async def test_models_are_worker_scoped_and_connection_save_clears_cache(
             assert worker_id in app.screen.heading
             await pilot.press("escape")
             await pilot.pause()
-        assert app.worker_models["writer"] == ["configured-a", "writer/remote"]
-        assert app.worker_models["reviewer"] == ["configured-b", "reviewer/remote"]
+        assert app.worker_models["writer"] == ["writer/remote"]
+        assert app.worker_models["reviewer"] == ["reviewer/remote"]
         await command(pilot, app, "/worker writer")
-        assert app.screen.models == ["configured-a", "writer/remote"]
+        assert app.screen.models == ["writer/remote"]
         app.screen.query_one("#field-base_url", Input).value = "https://changed.invalid/v1"
         await pilot.press("ctrl+s")
         await pilot.pause()
@@ -869,7 +876,7 @@ async def test_password_mask_and_cancel_never_persist_credentials(workbench, clo
         assert field.password
         assert "•" in field.render_line(0).text
         assert all(key not in app.export_screenshot() for key in (original.api_key, field.value))
-        assert len(app.screen.query(Button)) == 2
+        assert len(app.screen.query(Button)) == 3
         if close == "escape":
             await pilot.press("escape")
         else:
@@ -996,3 +1003,265 @@ async def test_messages_and_export_redact_store_and_in_memory_run_keys(workbench
         app.view_run = None
         app.set_message(raw, error=True)
         assert all(secret not in app.message for secret in secrets)
+
+
+async def test_hub_splash_tabs_preview_and_codex_arrow_navigation(workbench):
+    store, settings, workflow = workbench
+    second = Workflow(
+        "second",
+        "第二套评审流",
+        "验证选择页切换与预览",
+        [Node("A", "调研", "writer"), Node("B", "裁决", "reviewer", dependencies=["A"])],
+    )
+    store.save_workflow(second)
+    app = CTFlowApp(store, settings, workflow=workflow, start_in_hub=True)
+    async with app.run_test(size=(136, 40)) as pilot:
+        await pilot.pause()
+        assert app.page == "hub"
+        assert app.root.query_one("#hub-view").display
+        assert not app.root.query_one("#workbench-view").display
+        # 验证启动画面横幅与圆角实时预览图渲染
+        splash_text = str(app.root.query_one("#splash-banner", Static).render())
+        assert "多 Worker 依赖图" in splash_text
+        preview_text = str(app.root.query_one("#hub-preview Static", Static).render())
+        assert "╭" in preview_text
+
+        # 按 2 切换到 Workers 标签，再按 1 切回 Workflows
+        await pilot.press("2")
+        await pilot.pause()
+        assert app.hub_tab == "workers"
+        assert "writer" in str(app.root.query_one("#hub-preview Static", Static).render())
+
+        await pilot.press("1")
+        await pilot.pause()
+        assert app.hub_tab == "workflows"
+
+        # 筛选并按 → 一键进入第二套工作流
+        filter_box = app.root.query_one("#hub-filter", Input)
+        filter_box.value = "第二套"
+        await pilot.pause()
+        app.root.query_one("#hub-list", OptionList).focus()
+        await pilot.press("right")
+        await pilot.pause()
+        assert app.page == "workbench"
+        assert app.workflow.id == "second"
+
+        # 输入框有文字时按 ← 只移动光标，不误触返回 Hub
+        prompt = app.root.query_one("#prompt", Input)
+        prompt.focus()
+        prompt.value = "abc"
+        prompt.cursor_position = 3
+        await pilot.press("left")
+        await pilot.pause()
+        assert app.page == "workbench"
+        assert prompt.cursor_position == 2
+
+        # 空输入框按 ← 丝滑退回 Hub 选择页（Codex 风格）
+        prompt.value = ""
+        await pilot.pause()
+        await pilot.press("left")
+        await pilot.pause()
+        assert app.page == "hub"
+
+
+async def test_upstream_switch_cleans_stale_extra_body_and_old_model(workbench, monkeypatch):
+    """复现并根治痛点 1：从阿里千问切换上游到 DeepSeek 后，旧模型与旧 extra_body 零残留。"""
+    store, settings, workflow = workbench
+    qwen_worker = Worker(
+        "qwen",
+        "原阿里角色",
+        "qwen3.8-max",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="sk-old-aliyun-secret",
+        extra_body={"enable_thinking": False, "enable_search": True},
+        protocol="chat",
+    )
+    store.save_worker(qwen_worker)
+
+    class UpstreamMockClient:
+        def __init__(self, settings, worker):
+            self.worker = deepcopy(worker)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        async def list_models(self):
+            assert "deepseek" in self.worker.base_url
+            assert self.worker.extra_body == {}
+            return ["deepseek-chat", "deepseek-reasoner"]
+
+    monkeypatch.setattr("ctflow.ui.ModelClient", UpstreamMockClient)
+    app = CTFlowApp(store, settings, workflow)
+    app.worker_models["qwen"] = ["qwen3.8-max", "qwen-plus"]
+
+    async with app.run_test(size=(120, 36)) as pilot:
+        await command(pilot, app, "/worker qwen")
+        screen = app.screen
+        assert isinstance(screen, WorkerScreen)
+        assert "enable_thinking" in screen.query_one("#field-extra_body", TextArea).text
+
+        # 更换上游 Base URL 和 API Key
+        screen.query_one("#field-base_url", Input).value = "https://api.deepseek.com/v1"
+        screen.query_one("#field-api_key", Input).value = "sk-new-deepseek-secret"
+        await pilot.pause()
+
+        # 旧上游专属 extra_body 与模型下拉列表已自动净化清空
+        assert json.loads(screen.query_one("#field-extra_body", TextArea).text) == {}
+        assert screen.models == []
+
+        # 点击刷新模型：不残留 qwen3.8-max，自动切换到新上游首个模型 deepseek-chat
+        await screen.refresh_models()
+        await pilot.pause()
+        assert screen.models == ["deepseek-chat", "deepseek-reasoner"]
+        assert "qwen3.8-max" not in screen.models
+        assert screen.query_one("#field-model", Input).value == "deepseek-chat"
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        saved = store.get_worker("qwen")
+        assert saved.base_url == "https://api.deepseek.com/v1"
+        assert saved.model == "deepseek-chat"
+        assert saved.extra_body == {}
+
+
+async def test_visual_flow_builder_templates_add_edit_delete_without_mermaid(workbench):
+    """验证痛点 3：零手写 Mermaid 语法，可视化模板 + 节点增删 + 多选上游依赖构建工作流。"""
+    store, settings, workflow = workbench
+    app = CTFlowApp(store, settings, workflow)
+    async with app.run_test(size=(120, 36)) as pilot:
+        await command(pilot, app, "/flow new 可视化新流程")
+        editor = app.screen
+        assert isinstance(editor, FlowEditor)
+        assert editor.mode == "visual"
+
+        # 1. 点选一键模板：2→2→1 并行评审
+        btn_review = editor.query_one("#tpl-review", Button)
+        btn_review.scroll_visible(animate=False, immediate=True)
+        await pilot.pause()
+        assert await pilot.click("#tpl-review")
+        await pilot.pause()
+        assert len(editor.draft_workflow.nodes) == 5
+
+        # 2. 点击「+ 添加节点」，在 NodeScreen 勾选上游 E 并保存
+        btn_add = editor.query_one("#flow-add-node", Button)
+        btn_add.scroll_visible(animate=False, immediate=True)
+        await pilot.pause()
+        assert await pilot.click("#flow-add-node")
+        await pilot.pause()
+        assert isinstance(app.screen, NodeScreen)
+        app.screen.query_one("#field-label", Input).value = "归档输出"
+        deps = app.screen.query_one("#field-deps-list", SelectionList)
+        deps.deselect_all()
+        deps.select("E")
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, FlowEditor)
+        assert len(editor.draft_workflow.nodes) == 6
+        added = next(n for n in editor.draft_workflow.nodes if n.label == "归档输出")
+        assert added.dependencies == ["E"]
+
+        # 3. 切到 Mermaid 源码确认双向同步，再切回可视化并保存
+        editor._switch_mode("source")
+        await pilot.pause()
+        assert "归档输出" in editor.query_one("#field-source", TextArea).text
+        editor._switch_mode("visual")
+        await pilot.pause()
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        saved = store.get_workflow("可视化新流程")
+        assert len(saved.nodes) == 6
+        assert app.workflow.id == saved.id
+
+
+async def test_single_worker_chat_mode_with_multistep_tool_display(workbench):
+    """验证痛点 5 & 6：单 Worker 对话与内置多步工具调用实时卡片展示。"""
+    store, settings, workflow = workbench
+    (settings.workspace / "demo.txt").write_text("项目说明：CTflow", encoding="utf-8")
+    writer = store.get_worker("writer")
+    writer.builtin_tools = ["read_file"]
+    store.save_worker(writer)
+
+    class ChatToolClient:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def append_tool_round(self, messages, reply, results):
+            for call, res in results:
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": res})
+
+        async def stream(self, model, messages, on_text, tools=None):
+            self.step += 1
+            if self.step == 1:
+                return Reply(
+                    tool_calls=[
+                        {"id": "t1", "name": "read_file", "arguments": '{"path":"demo.txt"}'}
+                    ],
+                    usage=Usage(6, 2, 0.001),
+                    status="tool_calls",
+                )
+            assert "项目说明：CTflow" in messages[-1]["content"]
+            answer = "已读取 demo.txt，内容为：项目说明：CTflow"
+            on_text(answer)
+            return Reply(answer, usage=Usage(9, 5, 0.002), status="completed")
+
+    app = CTFlowApp(store, settings, workflow, client=ChatToolClient(), start_in_hub=True)
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        # 在 Hub 切到 Workers 标签，按 Enter 直接开聊
+        await pilot.press("2")
+        await pilot.pause()
+        app.root.query_one("#hub-filter", Input).value = "writer"
+        await pilot.pause()
+        app.root.query_one("#hub-list", OptionList).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.page == "chat"
+        assert app.chat_worker_id == "writer"
+
+        # 发送消息并等待多步工具回复完成
+        await command(pilot, app, "请帮我读一下 demo.txt")
+        assert app._chat_task is not None
+        await asyncio.wait_for(app._chat_task, 3)
+        await pilot.pause()
+
+        screen_text = app.export_screenshot()
+        assert "read_file" in screen_text
+        assert "项目说明：CTflow" in screen_text
+        assert app.chat_session is not None
+        assert len(app.chat_session.turns) == 1
+        assert app.chat_session.turns[0].tool_steps[0]["name"] == "read_file"
+
+        # 导出单聊记录并清空开始新对话
+        await command(pilot, app, "/export")
+        assert app.last_export is not None
+        assert "read_file" in app.last_export.read_text(encoding="utf-8")
+
+        await command(pilot, app, "/clear")
+        assert app.chat_session.turns == []
+
+        # 空框按 ← 退回 Hub
+        await pilot.press("left")
+        await pilot.pause()
+        assert app.page == "hub"
+
+
+@pytest.mark.parametrize("size", [(136, 40), (100, 30), (80, 24)])
+async def test_rounded_canvas_and_multi_size_hub_layouts(workbench, size):
+    store, settings, workflow = workbench
+    app = CTFlowApp(store, settings, workflow, start_in_hub=True)
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        assert app.page == "hub"
+        assert app.root.query_one("#hub-footer").region.bottom <= size[1]
+        # 进入工作台验证圆角节点（宽屏）与底部输入框不越界
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.page == "workbench"
+        assert app.root.query_one("#prompt").region.bottom <= size[1]
+        if size[0] >= 100:
+            drawing = graph(workflow, {}, "A", 80, 0).plain
+            assert "╭" in drawing and "╰" in drawing and "┌" not in drawing

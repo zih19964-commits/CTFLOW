@@ -30,6 +30,7 @@ class Reply:
     tool_calls: list[dict] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
     status: str = ""
+    tool_steps: list[dict] = field(default_factory=list)
 
 
 class ModelClient:
@@ -200,8 +201,9 @@ class ModelClient:
             "messages": messages,
             "stream": True,
             "max_tokens": self.settings.max_tokens,
-            "extra_body": self.worker.extra_body,
         }
+        if self.worker.extra_body:
+            parameters["extra_body"] = self.worker.extra_body
         schemas = self._schemas(tools)
         if schemas:
             parameters["tools"] = schemas
@@ -251,8 +253,9 @@ class ModelClient:
             "input": messages,
             "stream": True,
             "max_output_tokens": self.settings.max_tokens,
-            "extra_body": self.worker.extra_body,
         }
+        if self.worker.extra_body:
+            parameters["extra_body"] = self.worker.extra_body
         schemas = self._schemas(tools)
         if schemas:
             parameters["tools"] = schemas
@@ -346,12 +349,16 @@ class ModelClient:
                         elif kind == "content_block_start":
                             block = event.get("content_block", {})
                             if block.get("type") == "tool_use":
+                                raw_input = block.get("input")
+                                initial = (
+                                    json.dumps(raw_input, ensure_ascii=False)
+                                    if isinstance(raw_input, dict) and raw_input
+                                    else ""
+                                )
                                 blocks[event["index"]] = {
                                     "id": block.get("id", ""),
                                     "name": block.get("name", ""),
-                                    "arguments": json.dumps(
-                                        block.get("input", {}), ensure_ascii=False
-                                    ),
+                                    "arguments": initial,
                                 }
                         elif kind == "content_block_delta":
                             delta = event.get("delta", {})
@@ -382,7 +389,13 @@ class ModelClient:
                         elif kind == "error":
                             message = event.get("error", {}).get("message", "Anthropic 请求失败")
                             raise ValueError(self.worker.redact(message))
-            reply.tool_calls = [blocks[index] for index in sorted(blocks)]
+            reply.tool_calls = [
+                {
+                    **blocks[index],
+                    "arguments": blocks[index]["arguments"] or "{}",
+                }
+                for index in sorted(blocks)
+            ]
         except TimeoutError as exc:
             raise ValueError(f"模型请求超过 {self.settings.timeout:g} 秒") from exc
         except httpx.HTTPError as exc:
