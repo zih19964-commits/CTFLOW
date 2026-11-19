@@ -1,19 +1,10 @@
 # CTflow
 
-CTflow 是一个基于 Python、Textual、Rich 和 SQLite 的终端工作流工作台，正式界面采用 FLUX 布局。每个 Worker 保存独立的接口地址、API Key、模型、附加请求参数、固定上下文、技能和 MCP 服务器；Node 引用 Worker 并定义任务及直接依赖；Workflow 保存一套节点图，可以保留和切换多套。
+CTflow 是基于 Python、Textual、Rich、MCP SDK 与 `keyring` 构建的本地多 Worker 依赖图终端工作台。每个 Worker 独立装配 OpenAI 兼容接口地址、API Key、模型、附加参数、固定提示词、外置技能与标准 MCP 服务；Node 绑定 Worker 并声明节点任务与直接上游依赖；Workflow 将多个节点组织为有向无环图（DAG），支持顺序推进、并发探索、阶段汇合与独立裁决。
 
-执行链路为：选择工作流 → 装配 Worker → 加载上下文与技能 → 节点按需调用 MCP 工具 → 展示并保存结果。每个 Worker 可选择 Chat Completions、OpenAI Responses 或 Anthropic Messages 协议，并独立配置自定义服务地址、API Key 和模型 ID。
+系统内置物理隔离的编排服务者 `@architect`，可根据自然语言需求创建或调整角色与工作流拓扑，并在写入前自动备份配置快照以支持 `/rollback` 一键还原。命令行同时支持跨目录单行调用 `ctflow @<workflow_id> "任务"`，将中间进展输出至 `stderr`，将终点节点的最终结论纯净输出至 `stdout`。
 
-## 启动
-
-在 PowerShell 中运行：
-
-```powershell
-Set-Location E:\CTflow
-.\.venv\Scripts\ctflow.exe
-```
-
-也可以执行项目根目录的 `./start.ps1`，它会进入项目目录并启动同一个 FLUX 工作台。
+### 安装与启动
 
 首次安装使用 Python 3.11 或更高版本：
 
@@ -23,83 +14,55 @@ python -m venv .venv
 .\.venv\Scripts\ctflow.exe init
 ```
 
-在 `/worker <id>` 中为各 Worker 填写协议、`base_url`、API Key、模型和 MCP 服务器。Chat Completions 与 Responses 使用 OpenAI 兼容地址，Anthropic Messages 使用 Anthropic 根地址或 `/v1` 地址；同一工作流可以混用不同供应商和协议。模型 ID 可手填，刷新模型使用当前 Worker 的连接。`config/config.json` 保存并发数、超时、工具轮数和 MCP 服务器登记，以及新 Worker 的默认模型建议。
-
-Worker 的连接保存在本机 `data/ctflow.db`。Windows 上 API Key 使用 DPAPI 加密；其他平台使用 Fernet，并把主密钥保存在 `data/.ctflow.key`。密码框以掩码显示，公开 JSON 导出和持久化运行快照排除 API Key。新 Worker 的接口和密钥留空，需独立填写。备份时同时保留数据库和 `.ctflow.key`；跨平台恢复需要重新填写 Key。
-
-`extra_body` 用于供应商专用参数，其中的值按原文保存；不要把额外令牌或密码放进 `extra_body`。
-
-## 终端操作
-
-点击图中的节点可打开配置并装配 Worker。右侧节点列表单击选择，双击打开配置。底部对话区的空白和提示行可点击进入输入，输入文字与提示文字均可选择、复制，输入光标保持常亮。输入 `/` 显示命令提示，Tab 补全，Enter 执行。配置窗口使用 `Ctrl+S` 保存，`Esc` 或右上角 `×` 取消未保存修改。
-
-Worker 的模型配置和 `/models` 列表都提供“刷新模型”按钮。Worker 窗口使用当前未保存的接口、密钥与请求参数刷新，保留其余表单草稿；模型列表按 Worker 隔离。失败时显示原因，可再次点击重试。
-
-| 命令 | 操作 |
-| --- | --- |
-| `/hub` | 返回工作流与 Worker 选择页 |
-| `/chat`、`/chat <worker-id>` | 进入单 Worker 多轮对话 |
-| `/copy` | 复制单聊最后回答或工作流最终结果 |
-| `/clear (new)` | 在单聊模式下开启新对话，支持 `/clear` 或 `/new` 调用 |
-| `/worker` | 打开 Worker 列表 |
-| `/worker new`、`/worker <id>` | 配置独立接口、API Key、模型、附加参数、固定上下文和技能 |
-| `/models`、`/models <worker-id>` | 读取当前节点所引用的 Worker 或指定 Worker 的模型列表 |
-| `/flow` | 选择并加载已保存的工作流 |
-| `/flow new` | 新建工作流 |
-| `/flow edit` | 编辑当前图、名称和任务 |
-| `/flow save` | 保存当前工作流 |
-| `/flow save 新名称` | 另存一套工作流 |
-| `/node A` | 打开指定节点的配置 |
-| `/run`、`/run stop` | 执行或停止 |
-| `/view flow`、`/view run`、`/view result` | 切换编排、节点输出和结果视图 |
-| `/export` | 导出本次运行结果或单聊记录 Markdown |
-
-普通文本更新当前工作流的总任务。编辑保存后，可通过 `/flow` 切换，重启后仍从 SQLite 加载。运行期间可查看节点输出，配置和切换在本次运行结束后进行。
-
-内置工作流包含原三阶段评审、串行 `1→1→1`、三方向检索后正反判断的 `3→1→2`，以及增加综合裁决的 `3→1→2→1`。用途、依赖图和搜索参数见[工作流示例](docs/工作流示例.md)。
-
-## 添加技能
-
-把已有技能复制成 `E:\CTflow\skill\reviewer\SKILL.md`，在 Worker 界面选择 `@reviewer`。打开配置界面时重新扫描目录；技能内容在运行时装入请求。详情见 [技能目录说明](skill/README.md)。
-
-## 接入 MCP
-
-在 `config/config.json` 的 `mcp_servers` 中登记服务器，然后在 Worker 界面的“MCP 服务器”字段填写名称：
-
-```json
-{
-  "max_tool_rounds": 4,
-  "mcp_servers": {
-    "echo": {
-      "transport": "stdio",
-      "command": ".venv/Scripts/python.exe",
-      "args": ["tests/fixtures/mcp_server.py"]
-    }
-  }
-}
-```
-
-`transport` 支持 `stdio` 和 `http`；HTTP 使用 `url` 与可选 `headers`。Worker 只会看到已登记服务器的工具，模型请求工具时由 MCP 会话执行，再把结果送回模型。`ctflow mcp <worker>` 可只连接并列出该 Worker 的工具，不请求模型。当前最小版聚焦 MCP 工具循环，不提供内置文件/搜索工具，也不实现暂停、失败重试或画布拖拽。
-
-## 命令行与验证
+启动全屏 FLUX 工作台（也可直接执行根目录 `./start.ps1`）：
 
 ```powershell
-.\.venv\Scripts\ctflow.exe doctor
-.\.venv\Scripts\ctflow.exe models judge
-.\.venv\Scripts\ctflow.exe doctor --worker judge --live
-.\.venv\Scripts\ctflow.exe run review
-.\.venv\Scripts\ctflow.exe worker judge --task "分析给定方案"
-.\.venv\Scripts\ctflow.exe mcp judge
-.\.venv\Scripts\ctflow.exe list workflows
-.\.venv\Scripts\ctflow.exe list runs
-.\.venv\Scripts\ctflow.exe show <run-id>
+.\.venv\Scripts\ctflow.exe
+```
+
+全局运行参数与 `@architect` 模型连接保存在 `config/config.json`。外置扩展能力集中在 `extensions/` 目录：`extensions/mcp.json` 采用标准 `mcpServers` 结构登记工具服务（已预置 `deepseek-search-fetch-mcp` 联网检索模板），`extensions/skills/<name>/SKILL.md` 存放可勾选挂载的技能文档。业务资产以纯文件 JSON 保存在 `data/workers/`、`data/workflows/` 与 `data/runs/`，所有 API Key 均通过 `keyring` 独立托管在操作系统原生凭据管理器中。
+
+### 工作台交互与命令
+
+工作台包含选择页（Hub）、DAG 拓扑工作台与内存态单 Worker 对话页，支持空输入框按 `←` 返回选择页、点击画布节点直接装配 Worker 与依赖、在配置窗通过空格多选框勾选 MCP 与技能，以及按 `Ctrl+S` 保存。
+
+| 命令 | 用途 |
+| --- | --- |
+| `/hub` | 返回 Workflows / Workers / Runs 选择页 |
+| `/chat`、`/chat <worker-id>` | 进入单 Worker 内存多轮对话（`/chat architect` 打开内置编排助手） |
+| `/flow apply [名称]` | 在单聊模式提取最后一轮回复中的 `mermaid` 代码块并生成工作流 |
+| `/rollback` | 从 `config/backups/` 最新隔离快照恢复 `workers` 与 `workflows` |
+| `/copy` | 复制单聊最后回答或工作流终点节点结果 |
+| `/clear`、`/new` | 清空当前单聊内存上下文并开启新对话 |
+| `/worker`、`/worker new`、`/worker <id>` | 选择、新建或编辑 Worker 连接、MCP 与技能 |
+| `/models`、`/models <worker-id>` | 刷新并直接切换指定 Worker 的模型 |
+| `/flow`、`/flow new`、`/flow edit`、`/flow save [新名]` | 加载、可视化新建、编辑或另存工作流 |
+| `/node <id>`、`/node new` | 编辑指定节点或新增节点 |
+| `/run`、`/run stop` | 启动或停止当前工作流与单聊生成 |
+| `/view flow`、`/view run`、`/view result` | 切换编排说明、实时流式与工具轨迹、终点汇总视图 |
+| `/export` | 将工作流运行结果导出至 `data/exports/` Markdown 文件 |
+
+### 命令行单行直调与验证
+
+`ctflow` 会自动回退定位安装根目录的 `config/config.json`，支持在任意项目目录或外部智能代理中单行调用：
+
+```powershell
+E:\CTflow\.venv\Scripts\ctflow.exe @review "评估当前技术方案的可行性与边界条件"
+E:\CTflow\.venv\Scripts\ctflow.exe @@judge "独立复核给定论据"
+E:\CTflow\.venv\Scripts\ctflow.exe list workflows
+E:\CTflow\.venv\Scripts\ctflow.exe list runs
+E:\CTflow\.venv\Scripts\ctflow.exe show <run-id>
+E:\CTflow\.venv\Scripts\ctflow.exe mcp <worker-id>
+E:\CTflow\.venv\Scripts\ctflow.exe doctor --worker judge --live
+E:\CTflow\.venv\Scripts\ctflow.exe rollback
+```
+
+自动化检查与测试命令：
+
+```powershell
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe -m ruff check src tests
 .\.venv\Scripts\python.exe -m ruff format --check src tests
 ```
 
-`doctor --worker judge --live` 会实际请求指定 Worker 的模型；`run` 按各 Worker 独立连接执行并产生用量。自动化测试使用可控替身。CLI 成功终点输出写入 stdout，状态与错误写入 stderr。
-
-[入门指南](docs/入门指南.md)介绍配置和操作，[实现说明](docs/实现说明.md)介绍数据对象与执行链路，[实现范围](docs/实现范围.md)列出当前已实现与后续项。选定版原型保留在 [prototypes/tui-terminal](prototypes/tui-terminal/README.md)，正式启动入口使用 `src/ctflow`。
-
-`build/`、`artifacts/` 与 `data/` 是本地构建、验收和运行产物，已由 `.gitignore` 忽略；唯一源码目录是 `src/ctflow`，交付或排查时不要从旧构建目录启动。
+详细操作说明见 [入门指南](docs/入门指南.md)，内部数据流与标签协议见 [实现说明](docs/实现说明.md)，能力边界见 [实现范围](docs/实现范围.md)，核心架构演进依据见 [ADR 目录](docs/adr/0001-pure-file-storage-and-keyring.md)。
