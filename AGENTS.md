@@ -19,13 +19,13 @@
 
 ## 构建、测试与本地开发
 
-使用 Python 3.11 或更高版本。在项目根目录运行 `python -m venv .venv`，再执行 `.\.venv\Scripts\python.exe -m pip install -e ".[dev]"`。通过 `.\.venv\Scripts\ctflow.exe init` 初始化配置、扩展目录与示例预设，直接运行 `.\.venv\Scripts\ctflow.exe` 打开工作台，或在任意目录运行 `E:\CTflow\.venv\Scripts\ctflow.exe @review "评审任务"` 单行调用工作流。
+使用 `uv` 管理依赖与虚拟环境，要求 Python 3.11 或更高版本（开发版本锚点见 `.python-version`）。在项目根目录运行 `uv sync` 创建或同步 `.venv` 并安装开发依赖，依赖变更须同步更新并提交 `uv.lock`。通过 `uv run ctflow init` 初始化配置、扩展目录与示例预设，直接运行 `uv run ctflow` 打开工作台，或在任意目录运行 `uv run --project E:\CTflow ctflow "@review" "评审任务"` 单行调用工作流。
 
 开发依赖配置了 pytest、pytest-asyncio 与 Ruff：
 
-- `.\.venv\Scripts\python.exe -m pytest`：运行测试套件。
-- `.\.venv\Scripts\python.exe -m ruff check src tests`：检查代码风格与静态问题。
-- `.\.venv\Scripts\python.exe -m ruff format --check src tests`：检查代码格式。
+- `uv run pytest`：运行测试套件。
+- `uv run ruff check src tests`：检查代码风格与静态问题。
+- `uv run ruff format --check src tests`：检查代码格式。
 
 ## 代码风格与命名
 

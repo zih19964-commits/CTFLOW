@@ -6,18 +6,17 @@ CTflow 是基于 Python、Textual、Rich、MCP SDK 与 `keyring` 构建的本地
 
 ### 安装与启动
 
-首次安装使用 Python 3.11 或更高版本：
+使用 [uv](https://docs.astral.sh/uv/) 管理依赖与虚拟环境，要求 Python 3.11 或更高版本（开发版本锚点见 `.python-version`）：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.\.venv\Scripts\ctflow.exe init
+uv sync
+uv run ctflow init
 ```
 
 启动全屏 FLUX 工作台（也可直接执行根目录 `./start.ps1`）：
 
 ```powershell
-.\.venv\Scripts\ctflow.exe
+uv run ctflow
 ```
 
 全局运行参数与 `@architect` 模型连接保存在 `config/config.json`。外置扩展能力集中在 `extensions/` 目录：`extensions/mcp.json` 采用标准 `mcpServers` 结构登记工具服务（已预置 `deepseek-search-fetch-mcp` 联网检索模板），`extensions/skills/<name>/SKILL.md` 存放可勾选挂载的技能文档。业务资产以纯文件 JSON 保存在 `data/workers/`、`data/workflows/` 与 `data/runs/`，所有 API Key 均通过 `keyring` 独立托管在操作系统原生凭据管理器中。
@@ -44,25 +43,27 @@ python -m venv .venv
 
 ### 命令行单行直调与验证
 
-`ctflow` 会自动回退定位安装根目录的 `config/config.json`，支持在任意项目目录或外部智能代理中单行调用：
+`ctflow` 会自动回退定位安装根目录的 `config/config.json`，支持在任意项目目录或外部智能代理中通过 `--project` 单行调用（PowerShell 中需引用 `@` 开头的参数）：
 
 ```powershell
-E:\CTflow\.venv\Scripts\ctflow.exe @review "评估当前技术方案的可行性与边界条件"
-E:\CTflow\.venv\Scripts\ctflow.exe @@judge "独立复核给定论据"
-E:\CTflow\.venv\Scripts\ctflow.exe list workflows
-E:\CTflow\.venv\Scripts\ctflow.exe list runs
-E:\CTflow\.venv\Scripts\ctflow.exe show <run-id>
-E:\CTflow\.venv\Scripts\ctflow.exe mcp <worker-id>
-E:\CTflow\.venv\Scripts\ctflow.exe doctor --worker judge --live
-E:\CTflow\.venv\Scripts\ctflow.exe rollback
+uv run --project E:\CTflow ctflow "@review" "评估当前技术方案的可行性与边界条件"
+uv run --project E:\CTflow ctflow "@@judge" "独立复核给定论据"
+uv run --project E:\CTflow ctflow list workflows
+uv run --project E:\CTflow ctflow list runs
+uv run --project E:\CTflow ctflow show <run-id>
+uv run --project E:\CTflow ctflow mcp <worker-id>
+uv run --project E:\CTflow ctflow doctor --worker judge --live
+uv run --project E:\CTflow ctflow rollback
 ```
+
+`uv sync` 生成的 `E:\CTflow\.venv\Scripts\ctflow.exe` 仍可作为免解析入口直接调用，适合高频外部调用。
 
 自动化检查与测试命令：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe -m ruff check src tests
-.\.venv\Scripts\python.exe -m ruff format --check src tests
+uv run pytest
+uv run ruff check src tests
+uv run ruff format --check src tests
 ```
 
 详细操作说明见 [入门指南](docs/入门指南.md)，内部数据流与标签协议见 [实现说明](docs/实现说明.md)，能力边界见 [实现范围](docs/实现范围.md)，核心架构演进依据见 [ADR 目录](docs/adr/0001-pure-file-storage-and-keyring.md)。

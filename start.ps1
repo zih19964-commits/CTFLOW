@@ -1,4 +1,4 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-& "$PSScriptRoot\.venv\Scripts\python.exe" -m ctflow @args
+& uv run python -m ctflow @args
 exit $LASTEXITCODE

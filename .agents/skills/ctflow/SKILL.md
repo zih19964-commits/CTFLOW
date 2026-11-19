@@ -13,32 +13,32 @@ CTflow orchestrates reusable Workers across a directed acyclic graph (DAG). Inte
 
 ## Commands
 
-Run commands via `E:\CTflow\.venv\Scripts\ctflow.exe` (in PowerShell, quote `@...` tokens because `@` is PowerShell's splatting operator, or pass the workflow ID directly without `@`):
+Run commands from any directory via `uv run --project E:\CTflow ctflow` (in PowerShell, quote `@...` tokens because `@` is PowerShell's splatting operator, or pass the workflow ID directly without `@`):
 
 1. List available workflows or workers before choosing a topology:
    ```powershell
-   E:\CTflow\.venv\Scripts\ctflow.exe list workflows
-   E:\CTflow\.venv\Scripts\ctflow.exe list workers
+   uv run --project E:\CTflow ctflow list workflows
+   uv run --project E:\CTflow ctflow list workers
    ```
 
 2. Execute a saved workflow in one line and capture `stdout`:
    ```powershell
-   E:\CTflow\.venv\Scripts\ctflow.exe "@review" "评估任务或议题描述"
+   uv run --project E:\CTflow ctflow "@review" "评估任务或议题描述"
    # Or without @ in PowerShell:
-   E:\CTflow\.venv\Scripts\ctflow.exe review "评估任务或议题描述"
+   uv run --project E:\CTflow ctflow review "评估任务或议题描述"
    ```
    Common built-in workflows include `review` (2→2→1 parallel review), `serial-111` (1→1→1 fact-analysis-audit), `debate-312` (3→1→2 opposing arguments), and `decision-3121` (3→1→2→1 full synthesis and judgment).
 
 3. Execute a single configured Worker in one line:
    ```powershell
-   E:\CTflow\.venv\Scripts\ctflow.exe "@@judge" "独立复核问题"
+   uv run --project E:\CTflow ctflow "@@judge" "独立复核问题"
    ```
 
 4. Inspect historical runs or restore configuration snapshots if needed:
    ```powershell
-   E:\CTflow\.venv\Scripts\ctflow.exe list runs
-   E:\CTflow\.venv\Scripts\ctflow.exe show <run_id>
-   E:\CTflow\.venv\Scripts\ctflow.exe rollback
+   uv run --project E:\CTflow ctflow list runs
+   uv run --project E:\CTflow ctflow show <run_id>
+   uv run --project E:\CTflow ctflow rollback
    ```
 
 ## Validation

@@ -16,8 +16,8 @@ dependencies = [
     "httpx>=0.28,<1",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1", "httpx>=0.28,<1"]
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1"]
 
 [project.scripts]
 ctflow = "ctflow.cli:main"
