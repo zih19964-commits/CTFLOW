@@ -1,3 +1,7 @@
+"""CLI 回归测试：标准子命令、@workflow 一行简写直调、stdout/stderr 分离与快照回滚。"""
+
+from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path
@@ -25,12 +29,14 @@ class Client:
 
 @pytest.fixture
 def config_path(tmp_path):
-    path = tmp_path / "config.json"
+    path = tmp_path / "config" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
-                "workspace": ".",
-                "data_dir": "data",
+                "workspace": "..",
+                "data_dir": "../data",
+                "extensions_dir": "../extensions",
             }
         ),
         encoding="utf-8",
@@ -54,44 +60,52 @@ def test_cli_stdout_result_stderr_progress_and_task_override(config_path, monkey
     assert "Run " in out.err
     assert "success" in out.err
     settings = load_settings(config_path)
-    store = Store(settings.data_dir)
-    try:
-        assert store.list_runs()[0].task == "本次新任务"
-        assert store.get_workflow("review").task != "本次新任务"
-    finally:
-        store.close()
+    store = Store(settings.data_dir, backup_dir=settings.backup_dir)
+    assert store.list_runs()[0].task == "本次新任务"
+    assert store.get_workflow("review").task != "本次新任务"
 
 
-def test_cli_runtime_failure_exit1(config_path, monkeypatch, capsys):
+def test_cli_at_workflow_and_double_at_worker_shorthand(config_path, monkeypatch, capsys):
+    """验证外部一行命令 `ctflow @review "任务"` 与 `ctflow @@judge "问题"` 直接调用。"""
+    inject_client(monkeypatch)
+    assert cli.main(["--config", str(config_path), "@review", "评估纯文件架构"]) == 0
+    out1 = capsys.readouterr()
+    assert out1.out == "最终测试结果\n"
+
+    settings = load_settings(config_path)
+    store = Store(settings.data_dir, backup_dir=settings.backup_dir)
+    assert store.list_runs()[0].task == "评估纯文件架构"
+
+    assert cli.main(["--config", str(config_path), "@@judge", "独立评估结论"]) == 0
+    out2 = capsys.readouterr()
+    assert out2.out == "最终测试结果\n"
+
+
+def test_cli_runtime_failure_exit1_and_unknown_exit2(config_path, monkeypatch, capsys):
     inject_client(monkeypatch, fail=True)
     assert cli.main(["--config", str(config_path), "run", "review"]) == 1
     out = capsys.readouterr()
     assert out.out == ""
     assert "测试模型失败" in out.err
 
-
-def test_cli_unknown_workflow_exit2(config_path, capsys):
     assert cli.main(["--config", str(config_path), "run", "unknown"]) == 2
     assert "找不到" in capsys.readouterr().err
 
 
-def test_cli_init_creates_minimal_definitions(config_path, capsys):
-    assert cli.main(["--config", str(config_path), "init"]) == 0
-    settings = load_settings(config_path)
-    store = Store(settings.data_dir)
-    workflow = store.get_workflow("review")
-    try:
-        assert len(workflow.nodes) == 5
-        assert all(not hasattr(node, "pause_after") for node in workflow.nodes)
-        assert store.list_runs() == []
-    finally:
-        store.close()
+def test_cli_init_and_rollback(tmp_path, capsys):
+    cfg = tmp_path / "config" / "config.json"
+    assert cli.main(["--config", str(cfg), "init"]) == 0
+    assert (tmp_path / "extensions" / "mcp.json").is_file()
+    assert (tmp_path / "extensions" / "skills").is_dir()
+    settings = load_settings(cfg)
+    store = Store(settings.data_dir, backup_dir=settings.backup_dir)
+    store.create_backup()
+    store.delete_workflow("review")
+    capsys.readouterr()
 
-
-def test_cli_independent_worker(config_path, monkeypatch, capsys):
-    inject_client(monkeypatch)
-    assert cli.main(["--config", str(config_path), "worker", "judge", "--task", "独立问题"]) == 0
-    assert capsys.readouterr().out == "最终测试结果\n"
+    assert cli.main(["--config", str(cfg), "rollback"]) == 0
+    assert "已回滚配置快照" in capsys.readouterr().out
+    assert store.get_workflow("review").id == "review"
 
 
 @pytest.mark.parametrize("command, auto_run", [([], False), (["run", "review", "--tui"], True)])
@@ -115,16 +129,13 @@ def test_cli_tui_initial_workflow_and_auto_run(config_path, monkeypatch, command
 def test_models_and_live_doctor_use_selected_worker(config_path, monkeypatch, capsys):
     assert cli.main(["--config", str(config_path), "init"]) == 0
     settings = load_settings(config_path)
-    store = Store(settings.data_dir)
-    try:
-        for key in ("code", "judge"):
-            worker = store.get_worker(key)
-            worker.base_url = f"https://{key}.example.test/v1"
-            worker.api_key = f"test-key-{key}"
-            worker.extra_body = {"vendor": key}
-            store.save_worker(worker)
-    finally:
-        store.close()
+    store = Store(settings.data_dir, backup_dir=settings.backup_dir)
+    for key in ("code", "judge"):
+        worker = store.get_worker(key)
+        worker.base_url = f"https://{key}.example.test/v1"
+        worker.api_key = f"test-key-{key}"
+        worker.extra_body = {"vendor": key}
+        store.save_worker(worker)
     capsys.readouterr()
     seen = []
 
@@ -143,7 +154,6 @@ def test_models_and_live_doctor_use_selected_worker(config_path, monkeypatch, ca
             return [f"{self.worker.id}/model"]
 
         async def stream(self, model, messages, on_text):
-            assert model == self.worker.model
             return Reply("Worker连接成功", usage=Usage(1, 2), status="completed")
 
     monkeypatch.setattr(cli, "ModelClient", SelectedClient)
@@ -159,40 +169,29 @@ def test_models_and_live_doctor_use_selected_worker(config_path, monkeypatch, ca
     ]
 
 
-def test_live_doctor_requires_explicit_worker(config_path, capsys):
-    assert cli.main(["--config", str(config_path), "doctor", "--live"]) == 2
-    assert "--worker" in capsys.readouterr().err
-
-
-def test_mcp_command_lists_worker_tools(tmp_path, capsys):
+def test_mcp_command_lists_worker_tools_from_extensions_mcp_json(tmp_path, capsys):
     server = Path(__file__).parent / "fixtures" / "mcp_server.py"
-    path = tmp_path / "config.json"
-    path.write_text(
+    cfg = tmp_path / "config" / "config.json"
+    assert cli.main(["--config", str(cfg), "init"]) == 0
+    (tmp_path / "extensions" / "mcp.json").write_text(
         json.dumps(
             {
-                "workspace": ".",
-                "data_dir": "data",
-                "mcp_servers": {
+                "mcpServers": {
                     "echo": {
-                        "transport": "stdio",
                         "command": sys.executable,
                         "args": [str(server)],
                     }
-                },
+                }
             }
         ),
         encoding="utf-8",
     )
-    assert cli.main(["--config", str(path), "init"]) == 0
-    settings = load_settings(path)
-    store = Store(settings.data_dir)
-    try:
-        worker = store.get_worker("judge")
-        worker.mcp_servers = ["echo"]
-        store.save_worker(worker)
-    finally:
-        store.close()
+    settings = load_settings(cfg)
+    store = Store(settings.data_dir, backup_dir=settings.backup_dir)
+    worker = store.get_worker("judge")
+    worker.mcp_servers = ["echo"]
+    store.save_worker(worker)
     capsys.readouterr()
-    assert cli.main(["--config", str(path), "mcp", "judge"]) == 0
-    output = capsys.readouterr().out
-    assert "mcp_echo_echo" in output
+
+    assert cli.main(["--config", str(cfg), "mcp", "judge"]) == 0
+    assert "mcp_echo_echo" in capsys.readouterr().out

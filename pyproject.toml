@@ -12,7 +12,7 @@ dependencies = [
     "rich>=14.0,<15",
     "openai>=2.0,<3",
     "mcp>=1.0,<2",
-    "cryptography>=42,<51",
+    "keyring>=25,<27",
     "httpx>=0.28,<1",
 ]
 

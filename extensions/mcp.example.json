@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "deepseek_web": {
+      "command": "uvx",
+      "args": ["deepseek-search-fetch-mcp"],
+      "env": {
+        "DEEPSEEK_API_KEY": ""
+      }
+    }
+  }
+}

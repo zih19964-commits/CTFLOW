@@ -1,20 +1,25 @@
-"""SQLite 保存一致快照，JSON、Mermaid 和 Markdown 方便直接阅读。"""
+"""纯文件持久化存储、坏文件隔离与配置快照回滚（API Key 独立保存在系统 keyring）。"""
+
+from __future__ import annotations
 
 import json
 import os
 import re
-import sqlite3
-from dataclasses import asdict
+import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from ctflow.graph import to_mermaid
-from ctflow.models import Run, Worker, Workflow, to_dict
+from ctflow.graph import topological_layers
+from ctflow.models import ARCHITECT_ID, Run, Worker, Workflow, new_id, to_dict
 from ctflow.secrets import SecretBox
+
+_VALID_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_MAX_BACKUPS = 10
 
 
 def _check_id(value: str) -> None:
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+    if not _VALID_ID.fullmatch(value):
         raise ValueError(f"无效 ID：{value!r}，请使用字母、数字、下划线或连字符")
 
 
@@ -27,8 +32,8 @@ def _write_atomic(path: Path, content: str) -> None:
     try:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            # 运行中频繁保存快照时，跳过没有变化的节点结果。
-            if path.exists() and path.read_bytes() == content.encode("utf-8"):
+            encoded = content.encode("utf-8")
+            if path.exists() and path.read_bytes() == encoded:
                 return
             with NamedTemporaryFile(
                 mode="w", encoding="utf-8", newline="\n", dir=path.parent, delete=False
@@ -44,210 +49,256 @@ def _write_atomic(path: Path, content: str) -> None:
 
 
 class Store:
-    """本地轻量存储；调用者负责在退出时调用 close。"""
+    """纯文件本地存储：workers/、workflows/ 与 runs/ 均为可读 JSON，凭据存于 SecretBox。"""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        backup_dir: Path | None = None,
+        secrets: SecretBox | None = None,
+    ) -> None:
         self.data_dir = data_dir.resolve()
+        self.backup_dir = (backup_dir or (self.data_dir.parent / "config" / "backups")).resolve()
+        self._secrets = secrets or SecretBox()
+        self.corrupted_files: list[str] = []
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._secrets = SecretBox(self.data_dir)
-        self._db = sqlite3.connect(self._path("ctflow.db"))
-        with self._db:
-            self._db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS workers (
-                    id TEXT PRIMARY KEY COLLATE NOCASE,
-                    name TEXT NOT NULL,
-                    snapshot TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS workflows (
-                    id TEXT PRIMARY KEY COLLATE NOCASE,
-                    name TEXT NOT NULL,
-                    snapshot TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS runs (
-                    id TEXT PRIMARY KEY COLLATE NOCASE,
-                    created_at TEXT NOT NULL,
-                    snapshot TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS runs_created_at ON runs(created_at DESC);
-                """
-            )
-        self._migrate_worker_keys()
-
-    def _migrate_worker_keys(self) -> None:
-        """把旧版明文密钥就地升级为当前平台的加密密文。"""
-        rows = self._db.execute("SELECT id, snapshot FROM workers").fetchall()
-        with self._db:
-            for identifier, snapshot in rows:
-                data = json.loads(snapshot)
-                api_key = data.get("api_key", "")
-                if not api_key or self._secrets.is_encrypted(api_key):
-                    continue
-                data["api_key"] = self._secrets.protect(api_key)
-                self._db.execute(
-                    "UPDATE workers SET snapshot = ? WHERE id = ?",
-                    (json.dumps(data, ensure_ascii=False), identifier),
-                )
 
     def close(self) -> None:
-        self._db.close()
+        """纯文件存储无常驻句柄，保留对称关闭入口供调用方统一清理。"""
 
-    def _path(self, *parts: str) -> Path:
-        path = self.data_dir.joinpath(*parts)
-        if not path.resolve().is_relative_to(self.data_dir):
+    def _dir(self, kind: str) -> Path:
+        folder = (self.data_dir / kind).resolve()
+        if not folder.is_relative_to(self.data_dir):
+            raise ValueError(f"存储目录越界：{folder}")
+        return folder
+
+    def _file_path(self, kind: str, prefix: str, identifier: str) -> Path:
+        _check_id(identifier)
+        # 统一添加类型前缀（如 worker-con.json），避开 Windows CON/AUX/NUL 等保留设备名限制。
+        path = (self._dir(kind) / f"{prefix}-{identifier}.json").resolve()
+        if not path.is_relative_to(self.data_dir):
             raise ValueError(f"存储路径越出数据目录：{path}")
         return path
 
-    def _save(
-        self, table: str, identifier: str, label: str, snapshot: str, files: dict[Path, str]
-    ) -> None:
-        # 先完成可读文件导出，失败时保留数据库中上一份完整快照。
-        try:
-            with self._db:
-                row = self._db.execute(
-                    f"SELECT id FROM {table} WHERE id = ?", (identifier,)
-                ).fetchone()
-                if row is not None and row[0] != identifier:
-                    raise ValueError(f"ID 仅大小写不同会导致文件冲突：{identifier!r} / {row[0]!r}")
-                for path, content in files.items():
-                    _write_atomic(path, content)
-                column = "created_at" if table == "runs" else "name"
-                self._db.execute(
-                    f"INSERT INTO {table} (id, {column}, snapshot) VALUES (?, ?, ?) "
-                    f"ON CONFLICT(id) DO UPDATE SET {column}=excluded.{column}, "
-                    "snapshot=excluded.snapshot",
-                    (identifier, label, snapshot),
-                )
-        except sqlite3.Error as error:
-            raise RuntimeError(f"无法保存 {table}/{identifier} 到 SQLite：{error}") from error
+    def _check_case_collision(self, kind: str, prefix: str, identifier: str) -> None:
+        folder = self._dir(kind)
+        if not folder.is_dir():
+            return
+        head = f"{prefix}-"
+        for item in folder.glob(f"{prefix}-*.json"):
+            existing_id = item.stem[len(head) :]
+            if existing_id.casefold() == identifier.casefold() and existing_id != identifier:
+                raise ValueError(f"ID 仅大小写不同会导致文件冲突：{identifier!r} / {existing_id!r}")
 
-    def _get_named(self, table: str, id_or_name: str) -> dict:
-        row = self._db.execute(
-            f"SELECT snapshot FROM {table} WHERE id = ?", (id_or_name,)
-        ).fetchone()
-        if row is not None:
-            return json.loads(row[0])
-        rows = self._db.execute(
-            f"SELECT snapshot FROM {table} WHERE name = ?", (id_or_name,)
-        ).fetchall()
-        if not rows:
-            raise ValueError(f"找不到 {table}：{id_or_name}")
-        if len(rows) > 1:
-            raise ValueError(f"{table} 名称有歧义，请使用 ID：{id_or_name}")
-        return json.loads(rows[0][0])
+    def _iter_records(self, kind: str, prefix: str) -> list[tuple[str, dict]]:
+        folder = self._dir(kind)
+        if not folder.is_dir():
+            return []
+        head = f"{prefix}-"
+        records: list[tuple[str, dict]] = []
+        for path in sorted(folder.glob(f"{prefix}-*.json"), key=lambda p: p.name.casefold()):
+            rel = path.relative_to(self.data_dir).as_posix()
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("顶层不是 JSON 对象")
+                file_id = path.stem[len(head) :]
+                _check_id(file_id)
+                records.append((file_id, raw))
+            except (OSError, ValueError, KeyError, TypeError):
+                if rel not in self.corrupted_files:
+                    self.corrupted_files.append(rel)
+        return records
+
+    # ==================== Worker 存取 ====================
+    def _hydrate_worker(self, data: dict) -> Worker:
+        wid = str(data["id"])
+        _check_id(wid)
+        return Worker(
+            id=wid,
+            name=str(data["name"]),
+            model=str(data["model"]),
+            prompt=str(data.get("prompt", "")),
+            skills=list(data.get("skills", [])),
+            base_url=str(data.get("base_url", "")),
+            api_key=self._secrets.get(f"worker:{wid}"),
+            extra_body=dict(data.get("extra_body", {})),
+            mcp_servers=list(data.get("mcp_servers", [])),
+        )
 
     def save_worker(self, worker: Worker) -> None:
         _check_id(worker.id)
-        data = asdict(worker)
-        data["api_key"] = self._secrets.protect(worker.api_key)
-        snapshot = json.dumps(data, ensure_ascii=False)
-        self._save(
-            "workers",
-            worker.id,
-            worker.name,
-            snapshot,
-            {self._path("workers", f"worker-{worker.id}.json"): _json(worker)},
-        )
+        if worker.id.casefold() == ARCHITECT_ID:
+            raise ValueError(f"ID {ARCHITECT_ID!r} 为内置编排助手保留标识，请使用其他 ID")
+        self._check_case_collision("workers", "worker", worker.id)
+        path = self._file_path("workers", "worker", worker.id)
+        _write_atomic(path, _json(worker))
+        self._secrets.set(f"worker:{worker.id}", worker.api_key)
 
     def list_workers(self) -> list[Worker]:
-        rows = self._db.execute("SELECT snapshot FROM workers ORDER BY name, id").fetchall()
-        return [self._worker(json.loads(row[0])) for row in rows]
+        workers: list[Worker] = []
+        for _, raw in self._iter_records("workers", "worker"):
+            try:
+                if str(raw.get("id", "")).casefold() == ARCHITECT_ID:
+                    continue
+                workers.append(self._hydrate_worker(raw))
+            except (ValueError, KeyError, TypeError):
+                continue
+        workers.sort(key=lambda w: (w.name, w.id))
+        return workers
 
     def get_worker(self, id_or_name: str) -> Worker:
-        return self._worker(self._get_named("workers", id_or_name))
+        for _, raw in self._iter_records("workers", "worker"):
+            if str(raw.get("id", "")).casefold() == id_or_name.casefold():
+                return self._hydrate_worker(raw)
+        matches = [w for w in self.list_workers() if w.name == id_or_name]
+        if not matches:
+            raise ValueError(f"找不到 workers：{id_or_name}")
+        if len(matches) > 1:
+            raise ValueError(f"workers 名称有歧义，请使用 ID：{id_or_name}")
+        return matches[0]
 
-    def _worker(self, data: dict) -> Worker:
-        values = dict(data)
-        values["api_key"] = self._secrets.unprotect(values.get("api_key") or "")
-        return Worker(**values)
-
-    def delete_worker(self, id: str) -> None:
-        _check_id(id)
+    def delete_worker(self, identifier: str) -> None:
+        _check_id(identifier)
+        if identifier.casefold() == ARCHITECT_ID:
+            raise ValueError("内置编排助手不可删除")
         for workflow in self.list_workflows():
-            if any(node.worker_id.casefold() == id.casefold() for node in workflow.nodes):
-                raise ValueError(f"Worker {id} 正被工作流 {workflow.id} 引用，无法删除")
-        self._delete("workers", id, [self._path("workers", f"worker-{id}.json")])
+            if any(node.worker_id.casefold() == identifier.casefold() for node in workflow.nodes):
+                raise ValueError(f"Worker {identifier} 正被工作流 {workflow.id} 引用，无法删除")
+        path = self._file_path("workers", "worker", identifier)
+        folder = self._dir("workers")
+        exact = folder.is_dir() and any(p.name == path.name for p in folder.iterdir())
+        if not exact:
+            raise ValueError(f"找不到 workers：{identifier}")
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            raise RuntimeError(f"无法删除 workers/{identifier}：{error}") from error
+        self._secrets.delete(f"worker:{identifier}")
 
+    # ==================== Workflow 存取 ====================
     def save_workflow(self, workflow: Workflow) -> None:
         _check_id(workflow.id)
+        topological_layers(workflow)
         for node in workflow.nodes:
             _check_id(node.id)
             _check_id(node.worker_id)
-        # 持久化前强制执行完整 DAG 拓扑与节点身份校验，禁止任何带环或冲突的工作流落盘。
-        mermaid = to_mermaid(workflow)
-        snapshot = _json(workflow)
-        self._save(
-            "workflows",
-            workflow.id,
-            workflow.name,
-            snapshot,
-            {
-                self._path("workflows", f"workflow-{workflow.id}.json"): snapshot,
-                self._path("workflows", f"workflow-{workflow.id}.mmd"): mermaid,
-            },
-        )
+        self._check_case_collision("workflows", "workflow", workflow.id)
+        path = self._file_path("workflows", "workflow", workflow.id)
+        _write_atomic(path, _json(workflow))
 
     def list_workflows(self) -> list[Workflow]:
-        rows = self._db.execute("SELECT snapshot FROM workflows ORDER BY name, id").fetchall()
-        return [Workflow.from_dict(json.loads(row[0])) for row in rows]
+        workflows: list[Workflow] = []
+        for _, raw in self._iter_records("workflows", "workflow"):
+            try:
+                workflows.append(Workflow.from_dict(raw))
+            except (ValueError, KeyError, TypeError):
+                rel = f"workflows/workflow-{raw.get('id', '?')}.json"
+                if rel not in self.corrupted_files:
+                    self.corrupted_files.append(rel)
+        workflows.sort(key=lambda wf: (wf.name, wf.id))
+        return workflows
 
     def get_workflow(self, id_or_name: str) -> Workflow:
-        return Workflow.from_dict(self._get_named("workflows", id_or_name))
+        for _, raw in self._iter_records("workflows", "workflow"):
+            if str(raw.get("id", "")).casefold() == id_or_name.casefold():
+                return Workflow.from_dict(raw)
+        matches = [wf for wf in self.list_workflows() if wf.name == id_or_name]
+        if not matches:
+            raise ValueError(f"找不到 workflows：{id_or_name}")
+        if len(matches) > 1:
+            raise ValueError(f"workflows 名称有歧义，请使用 ID：{id_or_name}")
+        return matches[0]
 
-    def delete_workflow(self, id: str) -> None:
-        _check_id(id)
-        self._delete(
-            "workflows",
-            id,
-            [
-                self._path("workflows", f"workflow-{id}.json"),
-                self._path("workflows", f"workflow-{id}.mmd"),
-            ],
-        )
-
-    def _delete(self, table: str, identifier: str, paths: list[Path]) -> None:
-        row = self._db.execute(
-            f"SELECT id FROM {table} WHERE id = ? COLLATE BINARY", (identifier,)
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"找不到 {table}：{identifier}")
+    def delete_workflow(self, identifier: str) -> None:
+        _check_id(identifier)
+        path = self._file_path("workflows", "workflow", identifier)
+        folder = self._dir("workflows")
+        exact = folder.is_dir() and any(p.name == path.name for p in folder.iterdir())
+        if not exact:
+            raise ValueError(f"找不到 workflows：{identifier}")
         try:
-            with self._db:
-                for path in paths:
-                    path.unlink(missing_ok=True)
-                self._db.execute(f"DELETE FROM {table} WHERE id = ?", (identifier,))
-        except (OSError, sqlite3.Error) as error:
-            raise RuntimeError(f"无法删除 {table}/{identifier}：{error}") from error
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            raise RuntimeError(f"无法删除 workflows/{identifier}：{error}") from error
 
+    # ==================== Run 存取 ====================
     def save_run(self, run: Run) -> None:
         _check_id(run.id)
         if len({key.casefold() for key in run.nodes}) != len(run.nodes):
             raise ValueError("节点 ID 仅大小写不同会导致结果文件冲突")
-        snapshot = _json(run)
-        public_nodes = to_dict(run)["nodes"]
-        files = {self._path("runs", f"run-{run.id}", "run.json"): snapshot}
         for node_id, node in run.nodes.items():
             _check_id(node_id)
             if node.node_id != node_id:
                 raise ValueError(f"节点结果 ID 与字典键不一致：{node.node_id!r} / {node_id!r}")
-            public_node = public_nodes[node_id]
-            result = public_node["output"]
-            if public_node["error"]:
-                result += f"\n\n## 错误\n\n{public_node['error']}"
-            files[self._path("runs", f"run-{run.id}", f"node-{node_id}.md")] = result + "\n"
-        self._save("runs", run.id, run.created_at, snapshot, files)
+        self._check_case_collision("runs", "run", run.id)
+        path = self._file_path("runs", "run", run.id)
+        _write_atomic(path, _json(run))
 
-    def get_run(self, id: str) -> Run:
-        _check_id(id)
-        row = self._db.execute("SELECT snapshot FROM runs WHERE id = ?", (id,)).fetchone()
-        if row is None:
-            raise ValueError(f"找不到运行记录：{id}")
-        return Run.from_dict(json.loads(row[0]))
+    def get_run(self, identifier: str) -> Run:
+        _check_id(identifier)
+        for _, raw in self._iter_records("runs", "run"):
+            if str(raw.get("id", "")).casefold() == identifier.casefold():
+                return Run.from_dict(raw)
+        raise ValueError(f"找不到运行记录：{identifier}")
 
     def list_runs(self, limit: int = 50) -> list[Run]:
         if limit < 0:
             raise ValueError("运行记录数量不能为负数")
-        rows = self._db.execute(
-            "SELECT snapshot FROM runs ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
-        ).fetchall()
-        return [Run.from_dict(json.loads(row[0])) for row in rows]
+        if limit == 0:
+            return []
+        runs: list[Run] = []
+        for _, raw in self._iter_records("runs", "run"):
+            try:
+                runs.append(Run.from_dict(raw))
+            except (ValueError, KeyError, TypeError):
+                continue
+        runs.sort(key=lambda r: (r.created_at, r.id), reverse=True)
+        return runs[:limit]
+
+    # ==================== 快照备份与一键回滚 ====================
+    def create_backup(self) -> Path:
+        """在编排助手修改配置前自动将 workers/ 与 workflows/ 快照备份至隔离区。"""
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        snap_dir = self.backup_dir / f"snap-{stamp}-{new_id()[:6]}"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        for kind in ("workers", "workflows"):
+            src = self._dir(kind)
+            dst = snap_dir / kind
+            if src.is_dir():
+                shutil.copytree(src, dst)
+            else:
+                dst.mkdir(parents=True, exist_ok=True)
+        snapshots = sorted(
+            (p for p in self.backup_dir.glob("snap-*") if p.is_dir()),
+            key=lambda p: p.name,
+        )
+        for stale in snapshots[:-_MAX_BACKUPS]:
+            shutil.rmtree(stale, ignore_errors=True)
+        return snap_dir
+
+    def rollback_latest(self) -> str:
+        """从最近一份隔离快照恢复 workers/ 与 workflows/ 目录。"""
+        if not self.backup_dir.is_dir():
+            raise ValueError("尚无可用的配置备份快照")
+        snapshots = sorted(
+            (p for p in self.backup_dir.glob("snap-*") if p.is_dir()),
+            key=lambda p: p.name,
+        )
+        if not snapshots:
+            raise ValueError("尚无可用的配置备份快照")
+        latest = snapshots[-1]
+        for kind in ("workers", "workflows"):
+            target = self._dir(kind)
+            if target.exists():
+                shutil.rmtree(target)
+            src = latest / kind
+            if src.is_dir():
+                shutil.copytree(src, target)
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+        self.corrupted_files.clear()
+        w_cnt = len(self.list_workers())
+        wf_cnt = len(self.list_workflows())
+        return f"{latest.name}（已恢复 {w_cnt} 个 Worker、{wf_cnt} 套工作流）"

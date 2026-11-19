@@ -1,13 +1,22 @@
 {
   "model": "qwen3.8-max",
-  "models": ["qwen3.8-max", "qwen3.8-flash"],
+  "models": [
+    "qwen3.8-max",
+    "qwen3.8-flash"
+  ],
   "workspace": "..",
   "data_dir": "../data",
+  "extensions_dir": "../extensions",
   "concurrency": 3,
   "timeout": 60,
   "max_tokens": 1200,
-  "max_tool_rounds": 4,
+  "max_tool_rounds": 6,
   "currency": "CNY",
   "prices": {},
-  "mcp_servers": {}
+  "architect": {
+    "name": "编排助手",
+    "model": "qwen3.8-max",
+    "base_url": "",
+    "extra_body": {}
+  }
 }
