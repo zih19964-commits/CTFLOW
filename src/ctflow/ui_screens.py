@@ -1,9 +1,8 @@
-"""CTflow 模态弹窗与可视化构建器：Worker 净化配置、可视化工作流构建、节点装配与确认框。"""
+"""CTflow 模态弹窗与可视化构建器：Worker 装配、可视化工作流构建、节点依赖与确认框。"""
 
 from __future__ import annotations
 
 import json
-import re
 from copy import deepcopy
 from pathlib import Path
 
@@ -25,22 +24,20 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from ctflow.builtin_tools import BUILTIN_TOOL_CATALOG
 from ctflow.graph import parse_workflow, to_mermaid, topological_layers, validate_workflow
-from ctflow.models import Node, Worker, Workflow, upstream_signature
+from ctflow.models import ARCHITECT_ID, Node, Worker, Workflow, upstream_signature
 from ctflow.rendering import BLUE, GREEN, MUTED, ORANGE, RED, TEXT, graph
 from ctflow.tools import discover_skills, read_skills
 
 
 def _next_node_id(existing: set[str]) -> str:
-    """按 A..Z、N1..N99 顺序生成不与现有节点（含大小写）冲突的节点 ID。"""
-    folded = {item.casefold() for item in existing}
+    """按 A..Z、N1..N99 顺序生成不冲突的节点 ID。"""
     for code in range(ord("A"), ord("Z") + 1):
         candidate = chr(code)
-        if candidate.casefold() not in folded:
+        if candidate not in existing:
             return candidate
     index = 1
-    while f"n{index}" in folded:
+    while f"N{index}" in existing:
         index += 1
     return f"N{index}"
 
@@ -105,7 +102,6 @@ def _build_template_nodes(kind: str, workers: list[Worker]) -> list[Node]:
                 "E", "综合裁决", pick(("judge",), 4), "权衡正反两面，给出可执行结论。", ["C", "D"]
             ),
         ]
-    # debate: 3 -> 1 -> 2 -> 1
     return [
         Node("A", "核实事实", pick(("scout-facts", "research"), 0), "核实议题关键事实与来源。"),
         Node("B", "实践案例", pick(("scout-practice", "code"), 1), "调查可比方案与实践结果。"),
@@ -167,7 +163,6 @@ class Dialog(ModalScreen):
             yield Static(self.footer_hint(), classes="dialog-footer", markup=False)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        # 子控件（如长源码框或长列表）还可朝对应方向翻页时优先自行处理，到边界后再滚动外层弹窗。
         if action in {"page_up", "page_down"}:
             focused = self.focused
             if focused is not None and focused.id != "dialog-fields":
@@ -301,60 +296,54 @@ class FormScreen(Dialog):
 
 
 class WorkerScreen(FormScreen):
-    """Worker 配置窗口：上游变更时自动净化旧模型缓存与残留 extra_body。"""
+    """Worker 配置窗口：统一 Chat Completions 上游连接，MCP 与 Skill 均采用多选框勾选。"""
 
-    def __init__(self, worker: Worker, models: list[str], workspace: Path) -> None:
+    def __init__(self, worker: Worker, models: list[str], skills_dir: Path) -> None:
         self.worker = deepcopy(worker)
+        self.is_architect = worker.id == ARCHITECT_ID
         self.models = (
             list(dict.fromkeys(models)) if models else ([worker.model] if worker.model else [])
         )
-        self.workspace = workspace
-        self.skills = discover_skills(workspace)
-        self._origin_upstream = upstream_signature(worker.protocol, worker.base_url)
+        self.skills_dir = skills_dir
+        self.skills = {} if self.is_architect else discover_skills(skills_dir)
+        self._origin_upstream = upstream_signature(worker.base_url)
         self._last_upstream = self._origin_upstream
         self._origin_extra_text = json.dumps(worker.extra_body, ensure_ascii=False, indent=2)
         self._upstream_changed = False
         self._mounted = False
+        fields: dict[str, tuple[str, str]] = {
+            "name": ("Worker 名称", worker.name),
+            "base_url": ("Base URL · OpenAI 兼容自定义上游根地址", worker.base_url),
+            "api_key": ("API Key · 保存于系统凭据管理器（keyring）", worker.api_key),
+            "model": ("模型 ID · 刷新后选择或手动填写", worker.model),
+            "extra_body": (
+                "附加请求参数 extra_body · JSON 对象（切换上游将自动清空旧参数）",
+                self._origin_extra_text,
+            ),
+        }
+        multiline: tuple[str, ...] = ("extra_body",)
+        if not self.is_architect:
+            fields["prompt"] = ("固定上下文", worker.prompt)
+            multiline = ("prompt", "extra_body")
+        heading = (
+            f"编排助手连接配置 · @{worker.id} [内置隔离]"
+            if self.is_architect
+            else f"Worker 配置 · @{worker.id}"
+        )
         super().__init__(
-            f"Worker 配置 · @{worker.id}",
-            {
-                "name": ("Worker 名称", worker.name),
-                "protocol": ("上游协议", worker.protocol),
-                "base_url": ("Base URL · 自定义上游根地址", worker.base_url),
-                "api_key": ("API Key · 平台加密后保存在本机", worker.api_key),
-                "model": ("模型 ID · 刷新后选择或手动填写", worker.model),
-                "extra_body": (
-                    "协议附加参数 extra_body · JSON 对象（切换上游将自动清空旧参数）",
-                    self._origin_extra_text,
-                ),
-                "mcp_servers": (
-                    "MCP 服务器 · 逗号分隔，名称在 config.json 的 mcp_servers 中登记",
-                    ", ".join(worker.mcp_servers),
-                ),
-                "prompt": ("固定上下文", worker.prompt),
-            },
-            multiline=("prompt", "extra_body"),
+            heading,
+            fields,
+            multiline=multiline,
             required=("name", "model"),
             passwords=("api_key",),
-            choices={
-                "protocol": [
-                    ("Chat Completions (OpenAI 兼容)", "chat"),
-                    ("OpenAI Responses", "responses"),
-                    ("Anthropic Messages", "anthropic"),
-                ]
-            },
             wide=True,
         )
 
     def body(self) -> ComposeResult:
-        # 按“身份 → 上游连接 → 模型刷新与选择 → 附加参数 → 工具与技能 → 提示词”的自然顺序排布。
-        for key in ("name", "protocol", "base_url", "api_key"):
+        for key in ("name", "base_url", "api_key"):
             label, value = self.fields[key]
             yield Label(label)
-            if key in self.choices:
-                yield Select(self.choices[key], value=value, allow_blank=False, id=f"field-{key}")
-            else:
-                yield Input(value, id=f"field-{key}", password=key in self.passwords)
+            yield Input(value, id=f"field-{key}", password=key in self.passwords)
 
         yield Label(f"@{self.worker.id} 可用模型 · 使用上方连接草稿刷新")
         with Horizontal(classes="action-row"):
@@ -378,35 +367,43 @@ class WorkerScreen(FormScreen):
             else:
                 yield Input(value, id=f"field-{key}")
 
-        yield Label("内置多步工具 · Space 多选（工作区沙箱内执行）")
-        yield SelectionList[str](
-            *[
-                (
-                    f"{meta['label']} · {meta['description']}",
-                    tool_id,
-                    tool_id in self.worker.builtin_tools,
-                )
-                for tool_id, meta in BUILTIN_TOOL_CATALOG.items()
-            ],
-            id="builtin-tool-options",
-        )
+        if self.is_architect:
+            yield Static(
+                "安全隔离：@architect 的编排规范提示词与受管目录白名单已在源码中只读锁定。",
+                classes="field-note",
+                markup=False,
+            )
+            return
 
         registered_mcp = sorted(self.app.settings.mcp_servers.keys())
-        mcp_hint = (
-            f"已登记 MCP：{', '.join(registered_mcp)}"
-            if registered_mcp
-            else "config.json 尚未登记 MCP 服务器"
-        )
-        yield Label(f"{self.fields['mcp_servers'][0]}（{mcp_hint}）")
-        yield Input(self.fields["mcp_servers"][1], id="field-mcp_servers")
+        mcp_names = list(dict.fromkeys([*registered_mcp, *self.worker.mcp_servers]))
+        yield Label("MCP 服务器 · Space 多选（在 extensions/mcp.json 中登记）")
+        if mcp_names:
+            yield SelectionList[str](
+                *[
+                    (
+                        f"{m}" + (" · 未在 mcp.json 登记" if m not in registered_mcp else ""),
+                        m,
+                        m in self.worker.mcp_servers,
+                    )
+                    for m in mcp_names
+                ],
+                id="mcp-options",
+            )
+        else:
+            yield Static(
+                "尚未登记外部 MCP，可在 extensions/mcp.json 中按标准 mcpServers 格式添加。",
+                classes="field-note",
+                markup=False,
+            )
 
-        yield Label("@技能 · Space 多选，打开配置时重新发现")
+        yield Label("@技能 · Space 多选，打开配置时自动发现")
         yield Static(
-            str(self.workspace / "skill" / "<name>" / "SKILL.md"),
+            str(self.skills_dir / "<name>" / "SKILL.md"),
             classes="field-note",
             markup=False,
         )
-        names = list(dict.fromkeys([*self.skills, *self.worker.skills]))
+        skill_names = list(dict.fromkeys([*self.skills, *self.worker.skills]))
         yield SelectionList[str](
             *[
                 (
@@ -414,13 +411,13 @@ class WorkerScreen(FormScreen):
                     s,
                     s in self.worker.skills,
                 )
-                for s in names
+                for s in skill_names
             ],
             id="skill-options",
         )
-        if not names:
+        if not skill_names:
             yield Static(
-                "将技能放入 skill/<name>/SKILL.md 后重新打开配置即可勾选。",
+                "将技能放入 extensions/skills/<name>/SKILL.md 后重新打开配置即可勾选。",
                 classes="field-note",
                 markup=False,
             )
@@ -432,30 +429,20 @@ class WorkerScreen(FormScreen):
         super().on_mount()
         self._mounted = True
 
-    def _current_upstream(self) -> tuple[str, str]:
-        protocol = str(self.query_one("#field-protocol", Select).value)
-        base_url = self.query_one("#field-base_url", Input).value
-        return upstream_signature(protocol, base_url)
-
     def _handle_upstream_change(self) -> None:
-        """上游协议或根地址发生变化时，自动清理旧上游专属参数与模型缓存，防止参数残留。"""
+        """上游根地址变化时自动清空旧上游专属参数与模型缓存，防止供应商参数残留。"""
         if not self._mounted:
             return
-        new_sig = self._current_upstream()
+        new_sig = upstream_signature(self.query_one("#field-base_url", Input).value)
         if new_sig == self._last_upstream:
             return
-        prev_had_url = bool(self._last_upstream[1])
-        prev_protocol = self._last_upstream[0]
+        prev_had_url = bool(self._last_upstream)
         self._last_upstream = new_sig
-
-        # 只要之前已有上游地址、或者协议发生了切换，就视为更换上游。
-        if not prev_had_url and new_sig[0] == prev_protocol:
+        if not prev_had_url:
             return
 
         self._upstream_changed = True
         cleaned_parts: list[str] = []
-
-        # 清空旧上游的下拉模型列表，不再展示上个供应商的模型。
         if self.models:
             self.models = []
             choice = self.query_one("#model-choice", Select)
@@ -464,7 +451,6 @@ class WorkerScreen(FormScreen):
                 choice.clear()
             cleaned_parts.append("模型列表缓存")
 
-        # 若 extra_body 仍是旧上游的非空参数，自动重置为 {}，防止把阿里/旧厂商参数带给新上游。
         extra_widget = self.query_one("#field-extra_body", TextArea)
         if (
             self._origin_extra_text.strip() not in ("", "{}")
@@ -483,10 +469,6 @@ class WorkerScreen(FormScreen):
 
     @on(Input.Changed, "#field-base_url")
     def base_url_changed(self, event: Input.Changed) -> None:
-        self._handle_upstream_change()
-
-    @on(Select.Changed, "#field-protocol")
-    def protocol_changed(self, event: Select.Changed) -> None:
         self._handle_upstream_change()
 
     @on(Button.Pressed, "#reset-extra")
@@ -515,13 +497,7 @@ class WorkerScreen(FormScreen):
             draft = self.draft(allow_blank_model=True)
             remote = await self.app.fetch_models(draft)
             current_draft = self.draft(allow_blank_model=True)
-            if (
-                current_draft.protocol,
-                current_draft.base_url,
-                current_draft.api_key,
-                current_draft.extra_body,
-            ) != (
-                draft.protocol,
+            if (current_draft.base_url, current_draft.api_key, current_draft.extra_body) != (
                 draft.base_url,
                 draft.api_key,
                 draft.extra_body,
@@ -533,9 +509,6 @@ class WorkerScreen(FormScreen):
             current = model_input.value.strip()
             choice = self.query_one("#model-choice", Select)
 
-            # 核心净化逻辑：
-            # 1. 若更换过上游且当前值不在新上游列表中（旧模型残留），自动切到新上游首个模型。
-            # 2. 若未更换上游，保留用户正在手填的自定义模型草稿。
             auto_switched = ""
             if remote and (not current or (self._upstream_changed and current not in remote)):
                 selected = remote[0]
@@ -556,7 +529,7 @@ class WorkerScreen(FormScreen):
                 else:
                     choice.clear()
 
-            self._origin_upstream = upstream_signature(draft.protocol, draft.base_url)
+            self._origin_upstream = upstream_signature(draft.base_url)
             self._last_upstream = self._origin_upstream
             self._upstream_changed = False
             if auto_switched:
@@ -584,16 +557,27 @@ class WorkerScreen(FormScreen):
             raise ValueError("附加参数 extra_body 必须是合法的 JSON 对象") from None
         if not isinstance(extra_body, dict):
             raise ValueError("附加参数 extra_body 必须是 JSON 对象")
-        skills = list(self.query_one("#skill-options", SelectionList).selected)
-        builtin_tools = list(self.query_one("#builtin-tool-options", SelectionList).selected)
-        mcp_servers = [
-            name.strip().lstrip("@")
-            for name in re.split(r"[,，\n]", values["mcp_servers"])
-            if name.strip()
-        ]
+
         model_id = values["model"].strip()
         if not model_id and allow_blank_model:
             model_id = "__refresh__"
+
+        if self.is_architect:
+            return Worker(
+                self.worker.id,
+                values["name"].strip(),
+                model_id,
+                self.worker.prompt,
+                [],
+                base_url=values["base_url"].strip(),
+                api_key=values["api_key"],
+                extra_body=extra_body,
+                mcp_servers=list(self.worker.mcp_servers),
+            )
+
+        skills = list(self.query_one("#skill-options", SelectionList).selected)
+        mcp_widgets = self.query("#mcp-options")
+        mcp_servers = list(mcp_widgets.first(SelectionList).selected) if mcp_widgets else []
         return Worker(
             self.worker.id,
             values["name"].strip(),
@@ -604,8 +588,6 @@ class WorkerScreen(FormScreen):
             api_key=values["api_key"],
             extra_body=extra_body,
             mcp_servers=mcp_servers,
-            protocol=values["protocol"],
-            builtin_tools=builtin_tools,
         )
 
     def redact(self, text: str) -> str:
@@ -616,15 +598,16 @@ class WorkerScreen(FormScreen):
     def validate(self, values: dict[str, str]) -> Worker:
         super().validate(values)
         worker = self.draft(values)
-        unknown = set(worker.mcp_servers) - self.app.settings.mcp_servers.keys()
-        if unknown:
-            raise ValueError(f"未登记的 MCP 服务器：{', '.join(sorted(unknown))}")
-        read_skills(self.workspace, worker.skills)
+        if not self.is_architect:
+            unknown = set(worker.mcp_servers) - self.app.settings.mcp_servers.keys()
+            if unknown:
+                raise ValueError(f"未登记的 MCP 服务器：{', '.join(sorted(unknown))}")
+            read_skills(self.skills_dir, worker.skills)
         return worker
 
 
 class NodeScreen(FormScreen):
-    """节点装配与新增弹窗：通过可视化多选框选择上游依赖，无需手敲逗号列表。"""
+    """节点装配与新增弹窗：通过可视化多选框选择上游依赖。"""
 
     def __init__(
         self,
@@ -661,7 +644,6 @@ class NodeScreen(FormScreen):
         )
 
     def _downstream_ids(self) -> set[str]:
-        """找出当前节点的全部直接与间接下游节点，勾选它们作为上游必然形成回环。"""
         if self.is_new:
             return set()
         children: dict[str, list[str]] = {n.id: [] for n in self.workflow.nodes}
@@ -753,7 +735,7 @@ class NodeScreen(FormScreen):
 
 
 class FlowEditor(Dialog):
-    """可视化工作流构建器 + 高级 Mermaid 源码双模式，彻底告别必须手写语法。"""
+    """可视化工作流构建器 + 高级 Mermaid 源码双模式。"""
 
     BINDINGS = [
         Binding("ctrl+s", "save", "保存", priority=True),
@@ -1131,7 +1113,7 @@ class ModelPicker(PickerScreen):
         super().__init__(
             f"模型列表 · @{worker.id} · {worker.name}",
             [(model, Text(model, BLUE)) for model in models],
-            f"选择查看或切换模型 · /worker {worker.id} 编辑上游连接",
+            f"Enter 立即切换模型 · /worker {worker.id} 编辑上游连接",
         )
 
     def body(self) -> ComposeResult:

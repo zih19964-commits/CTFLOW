@@ -1,5 +1,7 @@
 .venv/
 config/config.json
+config/backups/
+extensions/mcp.json
 data/
 artifacts/
 __pycache__/

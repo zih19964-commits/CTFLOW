@@ -1,9 +1,13 @@
-"""项目共用的数据类，界面、调度器和 SQLite 使用同一份定义。"""
+"""项目共用的领域数据类：Worker、Node、Workflow 与 Run。"""
+
+from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 from uuid import uuid4
+
+ARCHITECT_ID = "architect"
 
 
 def now() -> str:
@@ -14,18 +18,16 @@ def new_id() -> str:
     return uuid4().hex[:12]
 
 
-def upstream_signature(protocol: str, base_url: str) -> tuple[str, str]:
-    """归一化上游协议与接口根地址，用于识别 Worker 是否更换了上游服务。"""
+def upstream_signature(base_url: str) -> str:
+    """归一化上游接口根地址，用于识别 Worker 是否更换了上游服务。"""
     raw = base_url.strip()
     if not raw:
-        return (protocol.strip().lower(), "")
+        return ""
     parsed = urlparse(raw)
     if parsed.scheme and parsed.netloc:
         path = parsed.path.rstrip("/")
-        normalized = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
-    else:
-        normalized = raw.rstrip("/").lower()
-    return (protocol.strip().lower(), normalized)
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+    return raw.rstrip("/").lower()
 
 
 def upstream_label(base_url: str) -> str:
@@ -39,7 +41,7 @@ def upstream_label(base_url: str) -> str:
 
 @dataclass
 class Worker:
-    """可复用的角色配置：指定模型连接、固定提示词、技能、内置工具和 MCP 服务器。"""
+    """可复用的角色装配方案：指定模型连接、固定提示词、外置技能和 MCP 服务器。"""
 
     id: str
     name: str
@@ -50,12 +52,8 @@ class Worker:
     api_key: str = field(default="", repr=False)
     extra_body: dict = field(default_factory=dict)
     mcp_servers: list[str] = field(default_factory=list)
-    protocol: str = "chat"
-    builtin_tools: list[str] = field(default_factory=list)
 
     def require_api(self) -> None:
-        if self.protocol not in {"chat", "responses", "anthropic"}:
-            raise ValueError("Worker 协议必须是 chat、responses 或 anthropic")
         address = urlparse(self.base_url)
         if address.scheme not in {"http", "https"} or not address.netloc or not address.hostname:
             raise ValueError("Worker 的 base_url 必须是 http 或 https 地址")
@@ -72,7 +70,7 @@ class Worker:
 
 @dataclass
 class Node:
-    """工作流中的一个任务；dependencies 保存直接上游的节点 ID。"""
+    """工作流中的一个任务实例；dependencies 保存直接上游节点 ID。"""
 
     id: str
     label: str
@@ -83,7 +81,7 @@ class Node:
 
 @dataclass
 class Workflow:
-    """总任务及其节点图；节点之间的依赖决定执行顺序。"""
+    """总任务及其有向无环节点图；节点依赖决定执行顺序。"""
 
     id: str
     name: str
@@ -92,13 +90,14 @@ class Workflow:
     source: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Workflow":
-        values = data.copy()
-        nodes = []
-        for node_data in data["nodes"]:
-            nodes.append(Node(**node_data))
-        values["nodes"] = nodes
-        return cls(**values)
+    def from_dict(cls, data: dict) -> Workflow:
+        return cls(
+            id=data["id"],
+            name=data["name"],
+            task=data["task"],
+            nodes=[Node(**item) for item in data["nodes"]],
+            source=data.get("source", ""),
+        )
 
 
 @dataclass
@@ -111,7 +110,7 @@ class Usage:
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
-    def add(self, other: "Usage") -> None:
+    def add(self, other: Usage) -> None:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         if self.cost is None or other.cost is None:
@@ -122,7 +121,7 @@ class Usage:
 
 @dataclass
 class NodeRun:
-    """一个节点在某次运行中的状态、输出和用量。"""
+    """一个节点在单次运行中的状态、输出、日志与用量。"""
 
     node_id: str
     status: str = "waiting"
@@ -132,19 +131,18 @@ class NodeRun:
     started_at: str | None = None
     finished_at: str | None = None
     logs: list[dict] = field(default_factory=list)
-    evidence: list[str] = field(default_factory=list)
     attempts: int = 0
 
     @classmethod
-    def from_dict(cls, data: dict) -> "NodeRun":
-        values = data.copy()
+    def from_dict(cls, data: dict) -> NodeRun:
+        values = dict(data)
         values["usage"] = Usage(**data["usage"])
         return cls(**values)
 
 
 @dataclass
 class Run:
-    """一次运行的工作流和 Worker 快照，以及各节点的运行记录。"""
+    """一次运行的工作流与 Worker 快照，以及各节点的执行记录。"""
 
     id: str
     workflow: Workflow
@@ -154,7 +152,7 @@ class Run:
     created_at: str = field(default_factory=now)
     finished_at: str | None = None
     nodes: dict[str, NodeRun] = field(default_factory=dict)
-    skill_contexts: dict[str, str] = field(default_factory=dict)
+    skill_contexts: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def usage(self) -> Usage:
@@ -165,22 +163,22 @@ class Run:
         return total
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Run":
-        values = data.copy()
-        values["workflow"] = Workflow.from_dict(data["workflow"])
-        workers = {}
-        for worker_id, worker_data in data["workers"].items():
-            workers[worker_id] = Worker(**worker_data)
-        values["workers"] = workers
-        nodes = {}
-        for node_id, node_data in data["nodes"].items():
-            nodes[node_id] = NodeRun.from_dict(node_data)
-        values["nodes"] = nodes
-        return cls(**values)
+    def from_dict(cls, data: dict) -> Run:
+        return cls(
+            id=data["id"],
+            workflow=Workflow.from_dict(data["workflow"]),
+            workers={wid: Worker(**wdata) for wid, wdata in data["workers"].items()},
+            task=data["task"],
+            status=data.get("status", "pending"),
+            created_at=data.get("created_at", now()),
+            finished_at=data.get("finished_at"),
+            nodes={nid: NodeRun.from_dict(ndata) for nid, ndata in data["nodes"].items()},
+            skill_contexts={wid: dict(val) for wid, val in data.get("skill_contexts", {}).items()},
+        )
 
 
 def to_dict(value: Worker | Workflow | Run) -> dict:
-    # 只有 Worker 表保留凭据；所有公开快照连同文本中的密钥一起脱敏。
+    """序列化为纯字典；排除 api_key 字段并对所有文本值脱敏密钥。"""
     workers = list(value.workers.values()) if isinstance(value, Run) else [value]
     secrets = sorted(
         {worker.api_key for worker in workers if isinstance(worker, Worker) and worker.api_key},
@@ -188,7 +186,7 @@ def to_dict(value: Worker | Workflow | Run) -> dict:
         reverse=True,
     )
 
-    def redact(item):
+    def redact(item: object) -> object:
         if isinstance(item, str):
             for secret in secrets:
                 item = item.replace(secret, "[密钥已隐藏]")
@@ -198,9 +196,9 @@ def to_dict(value: Worker | Workflow | Run) -> dict:
             item = [redact(part) for part in item]
         return item
 
-    return redact(
+    return redact(  # type: ignore[return-value]
         asdict(
             value,
-            dict_factory=lambda items: dict((key, part) for key, part in items if key != "api_key"),
+            dict_factory=lambda items: {key: part for key, part in items if key != "api_key"},
         )
     )

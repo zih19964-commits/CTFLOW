@@ -589,7 +589,7 @@ Button:hover {
     background: #131720;
 }
 
-#skill-options, #builtin-tool-options, #field-deps-list {
+#skill-options, #mcp-options, #field-deps-list {
     height: auto;
     min-height: 3;
     max-height: 8;

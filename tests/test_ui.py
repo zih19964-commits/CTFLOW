@@ -154,8 +154,9 @@ async def test_node_invalid_dependencies_and_close_discards(workbench):
         assert store.get_workflow("first") == workflow
 
 
-async def test_worker_models_arbitrary_context_skills_and_new(workbench):
+async def test_worker_models_arbitrary_context_skills_mcp_and_new(workbench):
     store, settings, workflow = workbench
+    settings.mcp_servers = {"echo": {"transport": "stdio", "command": "python", "args": []}}
     client = StreamClient()
     app = CTFlowApp(store, settings, workflow, client=client)
     async with app.run_test(size=(80, 24)) as pilot:
@@ -171,15 +172,12 @@ async def test_worker_models_arbitrary_context_skills_and_new(workbench):
         await command(pilot, app, "/worker writer")
         assert isinstance(app.screen, WorkerScreen)
         assert "自定义上游" in app.screen.fields["base_url"][0]
-        assert "MCP" in app.screen.fields["mcp_servers"][0]
-        assert "协议" in app.screen.fields["protocol"][0]
-        assert app.screen.query_one("#field-protocol", Select).value == "chat"
         assert app.screen.query_one("#field-name", Input).has_focus
         assert app.screen.skills == {}
         await pilot.press("escape")
         await pilot.pause()
         for name in ("analysis", "proof"):
-            folder = settings.workspace / "skill" / name
+            folder = settings.skills_dir / name
             folder.mkdir(parents=True)
             (folder / "SKILL.md").write_text(f"技能正文 {name}", encoding="utf-8")
         await command(pilot, app, "/worker writer")
@@ -189,8 +187,9 @@ async def test_worker_models_arbitrary_context_skills_and_new(workbench):
         assert app.screen.query_one("#field-model", Input).value == "provider/custom-model"
         app.screen.query_one("#field-model", Input).value = "any/provider/model-id"
         app.screen.query_one("#field-name", Input).value = "正式作者"
-        app.screen.query_one("#field-protocol", Select).value = "responses"
         app.screen.query_one("#field-prompt", TextArea).load_text("固定上下文\n第二行")
+        mcps = app.screen.query_one("#mcp-options", SelectionList)
+        mcps.select("echo")
         skills = app.screen.query_one("#skill-options", SelectionList)
         skills.scroll_visible(animate=False, immediate=True)
         await pilot.pause()
@@ -202,7 +201,7 @@ async def test_worker_models_arbitrary_context_skills_and_new(workbench):
         worker = store.get_worker("writer")
         assert worker.name == "正式作者"
         assert worker.model == "any/provider/model-id"
-        assert worker.protocol == "responses"
+        assert worker.mcp_servers == ["echo"]
         assert worker.prompt == "固定上下文\n第二行"
         assert set(worker.skills) == {"analysis", "proof"}
         assert all(not s.startswith("@") for s in worker.skills)
@@ -512,7 +511,7 @@ async def test_worker_scroll_keeps_close_and_shortcuts_visible(workbench):
     _, settings, workflow = workbench
     store = workbench[0]
     for index in range(20):
-        folder = settings.workspace / "skill" / f"skill-{index:02d}"
+        folder = settings.skills_dir / f"skill-{index:02d}"
         folder.mkdir(parents=True)
         (folder / "SKILL.md").write_text("固定技能上下文", encoding="utf-8")
     app = CTFlowApp(store, settings, workflow)
@@ -792,7 +791,7 @@ async def test_worker_connections_save_independently_and_reopen(workbench):
 
 async def test_refresh_uses_unsaved_connection_and_keeps_all_drafts(workbench, provider_clients):
     store, settings, workflow = workbench
-    folder = settings.workspace / "skill" / "draft-skill"
+    folder = settings.skills_dir / "draft-skill"
     folder.mkdir(parents=True)
     (folder / "SKILL.md").write_text("草稿技能", encoding="utf-8")
     app = CTFlowApp(store, settings, workflow)
@@ -1026,11 +1025,16 @@ async def test_hub_splash_tabs_preview_and_codex_arrow_navigation(workbench):
         preview_text = str(app.root.query_one("#hub-preview Static", Static).render())
         assert "╭" in preview_text
 
-        # 按 2 切换到 Workers 标签，再按 1 切回 Workflows
+        # 按 2 切换到 Workers 标签（首项置顶 @architect，下移选中业务角色），再按 1 切回 Workflows
         await pilot.press("2")
         await pilot.pause()
         assert app.hub_tab == "workers"
-        assert "writer" in str(app.root.query_one("#hub-preview Static", Static).render())
+        assert "architect" in str(app.root.query_one("#hub-preview Static", Static).render())
+        await pilot.press("down")
+        await pilot.pause()
+        assert "reviewer" in str(
+            app.root.query_one("#hub-preview Static", Static).render()
+        ) or "writer" in str(app.root.query_one("#hub-preview Static", Static).render())
 
         await pilot.press("1")
         await pilot.pause()
@@ -1074,7 +1078,6 @@ async def test_upstream_switch_cleans_stale_extra_body_and_old_model(workbench, 
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         api_key="sk-old-aliyun-secret",
         extra_body={"enable_thinking": False, "enable_search": True},
-        protocol="chat",
     )
     store.save_worker(qwen_worker)
 
@@ -1177,12 +1180,18 @@ async def test_visual_flow_builder_templates_add_edit_delete_without_mermaid(wor
         assert app.workflow.id == saved.id
 
 
-async def test_single_worker_chat_mode_with_multistep_tool_display(workbench):
-    """验证痛点 5 & 6：单 Worker 对话与内置多步工具调用实时卡片展示。"""
+async def test_single_worker_chat_mcp_and_architect_flow_apply_rollback(workbench):
+    """验证单聊 MCP 工具展示、@architect 隔离不可删除，以及 /flow apply 建图与 /rollback 回滚。"""
+    import sys
+    from pathlib import Path
+
+    mcp_script = Path(__file__).parent / "fixtures" / "mcp_server.py"
     store, settings, workflow = workbench
-    (settings.workspace / "demo.txt").write_text("项目说明：CTflow", encoding="utf-8")
+    settings.mcp_servers = {
+        "echo": {"transport": "stdio", "command": sys.executable, "args": [str(mcp_script)]}
+    }
     writer = store.get_worker("writer")
-    writer.builtin_tools = ["read_file"]
+    writer.mcp_servers = ["echo"]
     store.save_worker(writer)
 
     class ChatToolClient:
@@ -1198,55 +1207,80 @@ async def test_single_worker_chat_mode_with_multistep_tool_display(workbench):
             if self.step == 1:
                 return Reply(
                     tool_calls=[
-                        {"id": "t1", "name": "read_file", "arguments": '{"path":"demo.txt"}'}
+                        {"id": "t1", "name": "mcp_echo_echo", "arguments": '{"text":"CTflow"}'}
                     ],
                     usage=Usage(6, 2, 0.001),
                     status="tool_calls",
                 )
-            assert "项目说明：CTflow" in messages[-1]["content"]
-            answer = "已读取 demo.txt，内容为：项目说明：CTflow"
-            on_text(answer)
-            return Reply(answer, usage=Usage(9, 5, 0.002), status="completed")
+            if self.step == 2:
+                assert "MCP: CTflow" in messages[-1]["content"]
+                answer = "已调用 MCP，返回：MCP: CTflow"
+                on_text(answer)
+                return Reply(answer, usage=Usage(9, 5, 0.002), status="completed")
+            # @architect 回复带 mermaid 代码块
+            mermaid_ans = (
+                "为你生成如下双节点评审图：\n\n"
+                '```mermaid\nflowchart TD\n    A["初稿 @writer"] --> B["复核 @reviewer"]\n```'
+            )
+            on_text(mermaid_ans)
+            return Reply(mermaid_ans, usage=Usage(12, 8, 0.002), status="completed")
 
     app = CTFlowApp(store, settings, workflow, client=ChatToolClient(), start_in_hub=True)
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
-        # 在 Hub 切到 Workers 标签，按 Enter 直接开聊
+        # Hub 切到 Workers：首项为 @architect 且禁止删除
         await pilot.press("2")
         await pilot.pause()
+        listing = app.root.query_one("#hub-list", OptionList)
+        assert listing.get_option_at_index(0).id == "architect"
+        await pilot.press("d")
+        await pilot.pause()
+        assert "不可删除" in app.message
+
+        # 筛选进入 writer 单聊，验证 MCP 多步调用卡片
         app.root.query_one("#hub-filter", Input).value = "writer"
         await pilot.pause()
-        app.root.query_one("#hub-list", OptionList).focus()
+        listing.focus()
         await pilot.press("enter")
         await pilot.pause()
-        assert app.page == "chat"
-        assert app.chat_worker_id == "writer"
+        assert app.page == "chat" and app.chat_worker_id == "writer"
 
-        # 发送消息并等待多步工具回复完成
-        await command(pilot, app, "请帮我读一下 demo.txt")
+        await command(pilot, app, "请测试 MCP 工具")
         assert app._chat_task is not None
         await asyncio.wait_for(app._chat_task, 3)
         await pilot.pause()
 
         screen_text = app.export_screenshot()
-        assert "read_file" in screen_text
-        assert "项目说明：CTflow" in screen_text
-        assert app.chat_session is not None
-        assert len(app.chat_session.turns) == 1
-        assert app.chat_session.turns[0].tool_steps[0]["name"] == "read_file"
-
-        # 导出单聊记录并清空开始新对话
-        await command(pilot, app, "/export")
-        assert app.last_export is not None
-        assert "read_file" in app.last_export.read_text(encoding="utf-8")
+        assert "mcp_echo_echo" in screen_text
+        assert "已调用" in screen_text and "CTflow" in screen_text
+        assert app.chat_session.turns[0].assistant == "已调用 MCP，返回：MCP: CTflow"
+        assert not (settings.data_dir / "chats").exists()
 
         await command(pilot, app, "/clear")
         assert app.chat_session.turns == []
 
-        # 空框按 ← 退回 Hub
-        await pilot.press("left")
-        await pilot.pause()
-        assert app.page == "hub"
+        # 切换到 @architect（关闭外部 npx 以纯对话测试 /flow apply 建图与 /rollback 回滚）
+        await command(pilot, app, "/chat architect")
+        assert app.chat_worker_id == "architect"
+        app.settings.architect["base_url"] = "https://arch.invalid/v1"
+        app.store._secrets.set("architect", "arch-key")
+        from unittest.mock import patch
+
+        with patch("ctflow.architect.shutil.which", return_value=None):
+            await command(pilot, app, "帮我设计一个初稿加复核的流程")
+            assert app._chat_task is not None
+            await asyncio.wait_for(app._chat_task, 3)
+            await pilot.pause()
+
+        await command(pilot, app, "/flow apply 自动生成流")
+        assert app.page == "workbench"
+        assert app.workflow.name == "自动生成流"
+        assert len(store.list_workflows()) == 2
+
+        # 一键回滚到建图前的快照
+        await command(pilot, app, "/rollback")
+        assert len(store.list_workflows()) == 1
+        assert app.workflow.id == "first"
 
 
 @pytest.mark.parametrize("size", [(136, 40), (100, 30), (80, 24)])

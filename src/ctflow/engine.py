@@ -1,17 +1,19 @@
-"""以直接依赖任务和 Semaphore 调度 DAG，每个节点使用所属 Worker 的连接。"""
+"""以直接依赖任务和 Semaphore 并发调度 DAG，使用闭合 XML 标签协议传导上下游上下文。"""
+
+from __future__ import annotations
 
 import asyncio
 import copy
-import json
 from collections.abc import Callable
 
-from ctflow.builtin_tools import CompositeTools, has_configured_tools, validate_builtin_tools
 from ctflow.config import Settings
 from ctflow.graph import topological_layers, validate_workflow
+from ctflow.mcp_tools import MCPTools
 from ctflow.models import Node, NodeRun, Run, Workflow, new_id, now
 from ctflow.provider import ModelClient, Reply
 from ctflow.runtime import RuntimeResponseError, SingleRequestRuntime, ToolRuntime
 from ctflow.storage import Store
+from ctflow.tags import format_system_context, format_workflow_input
 from ctflow.tools import read_skills
 
 
@@ -33,34 +35,26 @@ class Engine:
         self._tasks: dict[str, asyncio.Task] = {}
 
     def create_run(self, workflow: Workflow, task: str | None = None) -> Run:
-        all_workers = {}
-        for worker in self.store.list_workers():
-            all_workers[worker.id] = worker
+        all_workers = {w.id: w for w in self.store.list_workers()}
         validate_workflow(workflow, all_workers)
 
-        workers = {}
-        for node in workflow.nodes:
-            workers[node.worker_id] = copy.deepcopy(all_workers[node.worker_id])
+        workers = {
+            node.worker_id: copy.deepcopy(all_workers[node.worker_id]) for node in workflow.nodes
+        }
         for worker in workers.values():
-            validate_builtin_tools(worker.builtin_tools)
             unknown = set(worker.mcp_servers) - self.settings.mcp_servers.keys()
             if unknown:
                 raise ValueError(
                     f"Worker {worker.id} 引用了未登记的 MCP：{', '.join(sorted(unknown))}"
                 )
 
-        # 技能在创建时读取并保存正文；后续编辑技能或 Worker 不改变本次运行。
-        skill_contexts = {}
-        for worker_id, worker in workers.items():
-            skill_contexts[worker_id] = read_skills(self.settings.workspace, worker.skills)
-
-        node_runs = {}
-        for node in workflow.nodes:
-            node_runs[node.id] = NodeRun(node.id)
-
-        run_task = task
-        if run_task is None:
-            run_task = workflow.task
+        # 创建运行快照时固化所选技能正文，后续外部编辑技能或 Worker 不影响本次运行。
+        skill_contexts = {
+            wid: read_skills(self.settings.skills_dir, worker.skills)
+            for wid, worker in workers.items()
+        }
+        node_runs = {node.id: NodeRun(node.id) for node in workflow.nodes}
+        run_task = workflow.task if task is None else task
         run = Run(
             new_id(),
             copy.deepcopy(workflow),
@@ -83,7 +77,6 @@ class Engine:
 
     def _redact(self, text: str) -> str:
         if self.run:
-            # 供应商异常也可能回显其他 Worker 的凭据，日志统一覆盖本次运行全部密钥。
             for worker in sorted(
                 self.run.workers.values(), key=lambda item: len(item.api_key), reverse=True
             ):
@@ -115,17 +108,21 @@ class Engine:
     async def _execute(self, run: Run) -> Run:
         run.status = "running"
         semaphore = asyncio.Semaphore(self.settings.concurrency)
-        nodes_by_id = {}
-        for node in run.workflow.nodes:
-            nodes_by_id[node.id] = node
+        nodes_by_id = {node.id: node for node in run.workflow.nodes}
+        layers = topological_layers(run.workflow)
+        layer_map = {
+            nid: layer_idx for layer_idx, layer in enumerate(layers, start=1) for nid in layer
+        }
         try:
             self.store.save_run(run)
             self._emit("run", status="running")
-            # 先按拓扑顺序建立全部任务，再让每个任务只等待直接上游，避免整层等待。
-            for layer in topological_layers(run.workflow):
+            # 按拓扑序建立协程，每个节点仅等待自身的直接上游而非整层屏障。
+            for layer in layers:
                 for node_id in layer:
                     self._tasks[node_id] = asyncio.create_task(
-                        self._execute_node(run, nodes_by_id[node_id], semaphore)
+                        self._execute_node(
+                            run, nodes_by_id[node_id], layer_map[node_id], nodes_by_id, semaphore
+                        )
                     )
             if self._stopped:
                 self.stop()
@@ -160,54 +157,43 @@ class Engine:
             self._emit("run", status=run.status)
         return run
 
-    def _messages(self, run: Run, node: Node) -> list[dict]:
-        """为当前节点组装角色指令、任务和直接上游结果。"""
+    def _messages(
+        self, run: Run, node: Node, layer: int, nodes_by_id: dict[str, Node]
+    ) -> list[dict]:
+        """使用闭合 XML 传导标签为当前节点组装角色指令、技能、预算与直接上游结论。"""
         worker = run.workers[node.worker_id]
-        skill_text = run.skill_contexts[worker.id]
-        prompt_parts = []
-        if worker.prompt:
-            prompt_parts.append(worker.prompt)
-        if skill_text:
-            prompt_parts.append(skill_text)
-        prompt = "\n\n".join(prompt_parts)
+        skills = run.skill_contexts.get(worker.id, {})
+        budget = self.settings.max_tool_rounds if worker.mcp_servers else None
+        system_prompt = format_system_context(worker, skills, max_tool_rounds=budget)
 
-        upstream = []
-        for upstream_id in node.dependencies:
-            upstream_state = run.nodes[upstream_id]
-            upstream.append(
-                {
-                    "node": upstream_id,
-                    "result": upstream_state.output,
-                    "evidence": upstream_state.evidence,
-                }
-            )
+        upstreams = [(nodes_by_id[uid], run.nodes[uid].output) for uid in node.dependencies]
+        user_payload = format_workflow_input(
+            workflow_id=run.workflow.id,
+            workflow_name=run.workflow.name,
+            global_task=run.task,
+            node=node,
+            layer=layer,
+            upstreams=upstreams,
+        )
         return [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"总任务：{run.task}\n当前节点：{node.label}\n节点补充任务：{node.task}\n"
-                    f"直接上游结果：{json.dumps(upstream, ensure_ascii=False)}"
-                ),
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_payload},
         ]
 
     async def _execute_node(
         self,
         run: Run,
         node: Node,
+        layer: int,
+        nodes_by_id: dict[str, Node],
         semaphore: asyncio.Semaphore,
     ) -> None:
         state = run.nodes[node.id]
         try:
             if node.dependencies:
-                # 只等待当前节点的直接上游；其他无关节点可以继续运行。
-                upstream_tasks = []
-                for upstream_id in node.dependencies:
-                    upstream_tasks.append(self._tasks[upstream_id])
-                await asyncio.gather(*upstream_tasks)
-            for upstream_id in node.dependencies:
-                if run.nodes[upstream_id].status != "success":
+                await asyncio.gather(*(self._tasks[uid] for uid in node.dependencies))
+            for uid in node.dependencies:
+                if run.nodes[uid].status != "success":
                     state.status = "blocked"
                     state.error = "直接上游节点未成功"
                     return
@@ -219,14 +205,6 @@ class Engine:
                 state.status = "running"
                 state.started_at = now()
                 state.attempts = 1
-                # 汇总上游证据，并按首次出现的顺序去重。
-                seen_evidence = set()
-                state.evidence = []
-                for upstream_id in node.dependencies:
-                    for evidence in run.nodes[upstream_id].evidence:
-                        if evidence not in seen_evidence:
-                            seen_evidence.add(evidence)
-                            state.evidence.append(evidence)
                 self.store.save_run(run)
                 self._emit("node", node.id, status="running")
                 self._log(state, "正在请求模型", type="request")
@@ -238,11 +216,14 @@ class Engine:
                 worker = run.workers[node.worker_id]
                 try:
                     if self.client is None:
-                        # 在并发槽位内创建并关闭节点专属连接，取消同样经过上下文清理。
                         async with ModelClient(self.settings, worker) as client:
-                            reply = await self._request(client, run, node, state, on_text)
+                            reply = await self._request(
+                                client, run, node, layer, nodes_by_id, state, on_text
+                            )
                     else:
-                        reply = await self._request(self.client, run, node, state, on_text)
+                        reply = await self._request(
+                            self.client, run, node, layer, nodes_by_id, state, on_text
+                        )
                 except RuntimeResponseError as exc:
                     state.usage = exc.reply.usage
                     state.output = self._redact(exc.reply.content)
@@ -272,22 +253,23 @@ class Engine:
         client: ModelClient,
         run: Run,
         node: Node,
+        layer: int,
+        nodes_by_id: dict[str, Node],
         state: NodeRun,
         on_text: Callable[[str], None],
     ) -> Reply:
         worker = run.workers[node.worker_id]
-        messages = self._messages(run, node)
-        if not has_configured_tools(worker):
+        messages = self._messages(run, node, layer, nodes_by_id)
+        if not worker.mcp_servers:
             return await SingleRequestRuntime(client).execute(worker.model, messages, on_text)
 
         def on_tool(event: str, name: str, detail: str = "") -> None:
-            prefix = "MCP 工具" if name.startswith("mcp_") else "工具"
             if event == "start":
-                self._log(state, f"调用{prefix} {name}", type="tool")
+                self._log(state, f"调用 MCP 工具 {name}", type="tool")
             elif event == "end":
-                self._log(state, f"{prefix}完成 {name}", type="tool")
+                self._log(state, f"MCP 工具完成 {name}", type="tool")
             else:
-                self._log(state, f"{prefix}失败 {name}：{detail}", type="tool")
+                self._log(state, f"MCP 工具失败 {name}：{detail}", type="tool")
 
         def on_tool_step(step: dict) -> None:
             redacted_step = {
@@ -295,7 +277,6 @@ class Engine:
                 "arguments": self._redact(str(step.get("arguments", ""))),
                 "result": self._redact(str(step.get("result", ""))),
             }
-            # 更新同 step 编号的记录（running -> ok/error），保证实时状态与终态一致。
             for existing in reversed(state.logs):
                 if (
                     existing.get("type") == "tool_step"
@@ -313,7 +294,7 @@ class Engine:
             state.logs.append(entry)
             self._emit("log", state.node_id, **entry)
 
-        async with CompositeTools(self.settings, worker) as tools:
+        async with MCPTools(self.settings, worker) as tools:
             return await ToolRuntime(
                 client,
                 self.settings.max_tool_rounds,

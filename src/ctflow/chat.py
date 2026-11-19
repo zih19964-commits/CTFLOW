@@ -1,26 +1,39 @@
-"""单 Worker 独立多轮对话会话，复用统一模型客户端与多步工具循环。"""
+"""单 Worker 及 @architect 独立内存态多轮对话，支持 MCP 工具调用与提取 Mermaid 建图。"""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import os
+import re
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from tempfile import NamedTemporaryFile
+from dataclasses import dataclass, field
 
-from ctflow.builtin_tools import CompositeTools, has_configured_tools, validate_builtin_tools
+from ctflow.architect import ArchitectTools
 from ctflow.config import Settings
-from ctflow.models import Usage, Worker, new_id, now
+from ctflow.mcp_tools import MCPTools
+from ctflow.models import ARCHITECT_ID, Usage, Worker, now
 from ctflow.provider import ModelClient
 from ctflow.runtime import RuntimeResponseError, SingleRequestRuntime, ToolRuntime
+from ctflow.storage import Store
+from ctflow.tags import format_system_context
 from ctflow.tools import read_skills
+
+_MERMAID_FENCE = re.compile(r"```mermaid[^\S\n]*\n(.*?)\n```", re.DOTALL)
+
+
+def extract_mermaid_source(text: str) -> str:
+    """从模型回复中提取最后一个 mermaid 代码块或裸 flowchart 文本。"""
+    blocks = _MERMAID_FENCE.findall(text)
+    if blocks:
+        return blocks[-1].strip()
+    stripped = text.strip()
+    if stripped.startswith(("flowchart TD", "flowchart LR")):
+        return stripped
+    raise ValueError("最后一轮回复中未找到有效的 ```mermaid 代码块")
 
 
 @dataclass
 class ChatTurn:
-    """单轮对话记录，包含用户输入、模型回复、工具步骤与用量。"""
+    """内存单轮对话记录（包含用户提问、流式回复、工具步骤与本轮用量）。"""
 
     user: str
     assistant: str = ""
@@ -31,16 +44,10 @@ class ChatTurn:
     created_at: str = field(default_factory=now)
     finished_at: str | None = None
 
-    @classmethod
-    def from_dict(cls, data: dict) -> ChatTurn:
-        values = dict(data)
-        values["usage"] = Usage(**data.get("usage", {}))
-        return cls(**values)
-
 
 @dataclass
 class ChatSession:
-    """单个 Worker 的多轮对话上下文与持久化记录。"""
+    """驻留内存的单 Worker 多轮对话上下文（不落盘保存）。"""
 
     id: str
     worker_id: str
@@ -58,35 +65,16 @@ class ChatSession:
                 total.add(turn.usage)
         return total
 
-    def to_public_dict(self, secret_worker: Worker | None = None) -> dict:
-        raw = asdict(self)
-        if secret_worker is None or not secret_worker.api_key:
-            return raw
-
-        def redact(item: object) -> object:
-            if isinstance(item, str):
-                return secret_worker.redact(item)
-            if isinstance(item, dict):
-                return {redact(k): redact(v) for k, v in item.items()}
-            if isinstance(item, list):
-                return [redact(v) for v in item]
-            return item
-
-        return redact(raw)  # type: ignore[return-value]
-
-    @classmethod
-    def from_dict(cls, data: dict) -> ChatSession:
-        values = dict(data)
-        values["turns"] = [ChatTurn.from_dict(item) for item in data.get("turns", [])]
-        return cls(**values)
-
-    def build_messages(self, worker: Worker, settings: Settings, user_text: str) -> list[dict]:
-        """组装 system 提示词、技能正文及历史多轮对话消息。"""
-        skill_text = read_skills(settings.workspace, worker.skills) if worker.skills else ""
-        parts = [part for part in (worker.prompt.strip(), skill_text.strip()) if part]
+    def build_messages(
+        self, worker: Worker, settings: Settings, user_text: str, *, has_tools: bool
+    ) -> list[dict]:
+        """组装带闭合标签的 System 上下文与内存多轮对话历史。"""
+        skills = read_skills(settings.skills_dir, worker.skills) if worker.skills else {}
+        budget = settings.max_tool_rounds if has_tools else None
+        sys_text = format_system_context(worker, skills, max_tool_rounds=budget)
         messages: list[dict] = []
-        if parts:
-            messages.append({"role": "system", "content": "\n\n".join(parts)})
+        if sys_text:
+            messages.append({"role": "system", "content": sys_text})
         for turn in self.turns:
             if turn.status == "success" and turn.assistant.strip():
                 messages.append({"role": "user", "content": turn.user})
@@ -95,92 +83,27 @@ class ChatSession:
         return messages
 
 
-def _write_json_atomic(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    temporary: Path | None = None
-    try:
-        with NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="\n", dir=path.parent, delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(text)
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def save_chat_session(data_dir: Path, session: ChatSession, worker: Worker | None = None) -> Path:
-    path = data_dir.resolve() / "chats" / f"chat-{session.id}.json"
-    _write_json_atomic(path, session.to_public_dict(worker))
-    return path
-
-
-def load_latest_chat(data_dir: Path, worker_id: str) -> ChatSession | None:
-    folder = data_dir.resolve() / "chats"
-    if not folder.is_dir():
-        return None
-    matches: list[ChatSession] = []
-    for file_path in folder.glob("chat-*.json"):
-        try:
-            session = ChatSession.from_dict(json.loads(file_path.read_text(encoding="utf-8")))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-        if session.worker_id == worker_id:
-            matches.append(session)
-    if not matches:
-        return None
-    matches.sort(key=lambda item: item.updated_at, reverse=True)
-    return matches[0]
-
-
-def export_chat_markdown(
-    data_dir: Path, session: ChatSession, currency: str, redact: Callable[[str], str]
-) -> Path:
-    lines = [
-        f"# 单 Worker 对话 · {session.worker_name} (@{session.worker_id})",
-        f"模型：{session.model} · 会话 ID：{session.id} · 轮数：{len(session.turns)}",
-    ]
-    for index, turn in enumerate(session.turns, start=1):
-        lines.append(f"## 第 {index} 轮 · 用户\n\n{turn.user}")
-        if turn.tool_steps:
-            step_lines = [
-                f"- Step {s['step']} `{s['name']}` ({s['status']}, {s.get('duration_ms', 0)}ms): "
-                f"`{s.get('arguments', '')}`"
-                for s in turn.tool_steps
-            ]
-            lines.append("### 工具调用\n\n" + "\n".join(step_lines))
-        body = turn.assistant or "（无输出）"
-        if turn.error:
-            body += f"\n\n错误：{turn.error}"
-        lines.append(f"## 第 {index} 轮 · {session.worker_name} ({turn.status})\n\n{body}")
-    usage = session.usage
-    cost = "费用待配置" if usage.cost is None else f"{usage.cost:.4f} {currency}"
-    lines.append(f"总 Token：{usage.total_tokens} · {cost}")
-    folder = data_dir.resolve() / "exports"
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / f"chat-{session.worker_id}-{new_id()}.md"
-    target.write_text(redact("\n\n".join(lines)) + "\n", encoding="utf-8")
-    return target
-
-
 async def run_chat_turn(
     session: ChatSession,
     worker: Worker,
     settings: Settings,
     user_text: str,
     *,
+    store: Store | None = None,
     client: ModelClient | None = None,
     on_update: Callable[[], None] | None = None,
 ) -> ChatTurn:
-    """在指定 Worker 上执行一轮对话，实时流式更新文本与工具步骤。"""
-    validate_builtin_tools(worker.builtin_tools)
-    unknown_mcp = set(worker.mcp_servers) - settings.mcp_servers.keys()
-    if unknown_mcp:
-        raise ValueError(f"Worker {worker.id} 引用了未登记的 MCP：{', '.join(sorted(unknown_mcp))}")
+    """在指定 Worker（或独立隔离的 @architect）上执行一轮对话。"""
+    is_architect = worker.id == ARCHITECT_ID
+    if not is_architect:
+        unknown_mcp = set(worker.mcp_servers) - settings.mcp_servers.keys()
+        if unknown_mcp:
+            raise ValueError(
+                f"Worker {worker.id} 引用了未登记的 MCP：{', '.join(sorted(unknown_mcp))}"
+            )
 
-    messages = session.build_messages(worker, settings, user_text)
+    has_tools = bool(worker.mcp_servers)
+    messages = session.build_messages(worker, settings, user_text, has_tools=has_tools)
     session.worker_name = worker.name
     session.model = worker.model
     turn = ChatTurn(user=user_text, status="running")
@@ -211,12 +134,24 @@ async def run_chat_turn(
             on_update()
 
     async def execute_with(active_client: ModelClient) -> None:
-        if not has_configured_tools(worker):
+        if not has_tools:
             reply = await SingleRequestRuntime(active_client).execute(
                 worker.model, messages, on_text
             )
+        elif is_architect and store is not None:
+            async with ArchitectTools(settings, store, worker) as tools:
+                if tools.schemas:
+                    reply = await ToolRuntime(
+                        active_client,
+                        settings.max_tool_rounds,
+                        on_tool_step=on_tool_step,
+                    ).execute(worker.model, messages, on_text, tools)
+                else:
+                    reply = await SingleRequestRuntime(active_client).execute(
+                        worker.model, messages, on_text
+                    )
         else:
-            async with CompositeTools(settings, worker) as tools:
+            async with MCPTools(settings, worker) as tools:
                 reply = await ToolRuntime(
                     active_client,
                     settings.max_tool_rounds,
@@ -247,7 +182,6 @@ async def run_chat_turn(
     finally:
         turn.finished_at = now()
         session.updated_at = turn.finished_at
-        save_chat_session(settings.data_dir, session, worker)
         if on_update:
             on_update()
     return turn

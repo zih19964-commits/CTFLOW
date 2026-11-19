@@ -1,4 +1,4 @@
-"""按 Worker 装配的 MCP 工具会话。"""
+"""按标准 MCP 协议建立 stdio / http 工具会话并暴露给节点与单聊。"""
 
 from __future__ import annotations
 
@@ -17,19 +17,27 @@ _TOOL_ID = re.compile(r"[^A-Za-z0-9_-]")
 
 
 class MCPTools:
-    def __init__(self, settings: Settings, worker: Worker) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        worker: Worker,
+        *,
+        extra_servers: dict[str, dict] | None = None,
+    ) -> None:
         self.settings = settings
         self.worker = worker
+        self.extra_servers = extra_servers or {}
         self.stack = AsyncExitStack()
         self.schemas: list[dict] = []
         self._calls: dict[str, tuple[ClientSession, str]] = {}
 
     async def __aenter__(self) -> MCPTools:
+        catalog = {**self.settings.mcp_servers, **self.extra_servers}
         try:
             for server_name in self.worker.mcp_servers:
-                if server_name not in self.settings.mcp_servers:
+                if server_name not in catalog:
                     raise ValueError(f"未登记的 MCP 服务器：{server_name}")
-                config = self.settings.mcp_servers[server_name]
+                config = catalog[server_name]
                 session = await self._connect(config)
                 listing = await session.list_tools()
                 for tool in listing.tools:
@@ -51,7 +59,7 @@ class MCPTools:
 
     async def _connect(self, config: dict) -> ClientSession:
         if config["transport"] == "stdio":
-            # MCP 服务器的日志写入临时文件，避免污染 Textual 全屏界面。
+            # MCP 服务器的 stderr 写入临时文件，防止污染 Textual 全屏画布。
             errlog = self.stack.enter_context(tempfile.TemporaryFile(mode="w+", encoding="utf-8"))
             transport = await self.stack.enter_async_context(
                 stdio_client(
