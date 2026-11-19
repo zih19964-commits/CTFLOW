@@ -97,7 +97,8 @@ def test_parse_inline_chain(workers: dict[str, Worker]) -> None:
         ('flowchart TD\nA --> B["二 @write"]', "悬空节点：A"),
         ('flowchart TD\nA["一 @research"]\nA["二 @write"]', "重复定义"),
         ('flowchart TD\nA["一 @research"] --> A', "自环"),
-        ('flowchart TD\nA["一 @research"] --> B["二 @write"] --> A', "存在环"),
+        ('flowchart TD\nA["一 @research"] --> B["二 @write"] --> A', "A → B → A"),
+        ('flowchart TD\nA["一 @research"]\na["二 @write"]', "大小写冲突"),
         ('flowchart TD\nA["一 @research"] --> B["二 @write"]\nA --> B', "重复依赖"),
         ('flowchart TD\nA["坏\\q @research"]', "转义无效"),
         ('flowchart TD\nA["坏\\n名称 @research"]', "换行"),
@@ -164,8 +165,26 @@ def test_topological_layers_rejects_disconnected_cycle() -> None:
         Node("B", "环一", "research", dependencies=["C"]),
         Node("C", "环二", "research", dependencies=["B"]),
     )
-    with pytest.raises(ValueError, match="存在环"):
+    with pytest.raises(ValueError, match="B → C → B"):
         topological_layers(workflow)
+
+
+def test_cycle_error_isolates_minimal_loop_without_downstream_tail(
+    workers: dict[str, Worker],
+) -> None:
+    workflow = make_workflow(
+        Node("D", "受牵连下游", "write", dependencies=["B"]),
+        Node("A", "环首", "research", dependencies=["C"]),
+        Node("B", "环中", "write", dependencies=["A"]),
+        Node("C", "环尾", "research", dependencies=["B"]),
+    )
+    with pytest.raises(ValueError, match="A → B → C → A"):
+        validate_workflow(workflow, workers)
+    with pytest.raises(ValueError, match="大小写冲突"):
+        validate_workflow(
+            make_workflow(Node("StepA", "一", "research"), Node("stepa", "二", "write")),
+            workers,
+        )
 
 
 def test_serialization_round_trip_and_metadata_preservation(workers: dict[str, Worker]) -> None:

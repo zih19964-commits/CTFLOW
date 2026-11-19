@@ -24,11 +24,16 @@ def _dependency_graph(workflow: Workflow) -> tuple[dict[str, int], dict[str, lis
     if not workflow.nodes:
         raise ValueError("工作流至少需要一个节点")
     indegree: dict[str, int] = {}
+    seen_folded: dict[str, str] = {}
     for node in workflow.nodes:
         if not _ID.fullmatch(node.id):
             raise ValueError(f"节点 ID 无效：{node.id!r}")
         if node.id in indegree:
             raise ValueError(f"重复节点 ID：{node.id}")
+        folded = node.id.casefold()
+        if folded in seen_folded:
+            raise ValueError(f"重复节点 ID（大小写冲突）：{node.id} 与 {seen_folded[folded]}")
+        seen_folded[folded] = node.id
         indegree[node.id] = len(node.dependencies)
 
     successors: dict[str, list[str]] = {}
@@ -46,6 +51,25 @@ def _dependency_graph(workflow: Workflow) -> tuple[dict[str, int], dict[str, lis
             seen.add(parent)
             successors[parent].append(node.id)
     return indegree, successors
+
+
+def _find_cycle(workflow: Workflow, blocked_set: set[str]) -> list[str]:
+    """在未消解入度的受阻子图上沿前驱回溯，O(V + E) 定位一条精确有向回环。"""
+    by_id = {node.id: node for node in workflow.nodes}
+    order_index = {node.id: idx for idx, node in enumerate(workflow.nodes)}
+    current = next(node.id for node in workflow.nodes if node.id in blocked_set)
+    visited_pos: dict[str, int] = {}
+    trace: list[str] = []
+    while current not in visited_pos:
+        visited_pos[current] = len(trace)
+        trace.append(current)
+        current = next(dep for dep in by_id[current].dependencies if dep in blocked_set)
+
+    # trace[pos:] 逆着依赖边记录了环，反转后即为顺着执行流向的有向环。
+    raw_cycle = list(reversed(trace[visited_pos[current] :]))
+    start_pos = min(range(len(raw_cycle)), key=lambda idx: order_index[raw_cycle[idx]])
+    ordered = raw_cycle[start_pos:] + raw_cycle[:start_pos]
+    return [*ordered, ordered[0]]
 
 
 def topological_layers(workflow: Workflow) -> list[list[str]]:
@@ -70,12 +94,10 @@ def topological_layers(workflow: Workflow) -> list[list[str]]:
                     next_ready.append(child)
         ready = next_ready
     if visited != len(indegree):
-        blocked_nodes = []
-        for node_id, count in indegree.items():
-            if count > 0:
-                blocked_nodes.append(node_id)
+        blocked_nodes = [node_id for node_id, count in indegree.items() if count > 0]
+        cycle_path = " → ".join(_find_cycle(workflow, set(blocked_nodes)))
         blocked = "、".join(blocked_nodes)
-        raise ValueError(f"工作流存在环，无法完成拓扑分层；未就绪节点：{blocked}")
+        raise ValueError(f"工作流存在环（{cycle_path}），无法完成拓扑分层；未就绪节点：{blocked}")
     return layers
 
 

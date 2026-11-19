@@ -530,3 +530,30 @@ def test_old_run_without_worker_connection_fields_loads(run):
     assert worker.base_url == worker.api_key == ""
     assert worker.extra_body == {}
     assert loaded == run
+
+
+@pytest.mark.parametrize(
+    ("nodes", "message"),
+    [
+        ([], "至少需要"),
+        ([Node("A", "自环", "research", dependencies=["A"])], "自环"),
+        (
+            [
+                Node("A", "环一", "research", dependencies=["B"]),
+                Node("B", "环二", "research", dependencies=["A"]),
+            ],
+            "A → B → A",
+        ),
+        ([Node("A", "一", "research"), Node("A", "二", "research")], "重复节点 ID"),
+        ([Node("A", "一", "research"), Node("a", "二", "research")], "大小写冲突"),
+        ([Node("A", "悬空", "research", dependencies=["X"])], "悬空节点"),
+    ],
+)
+def test_save_workflow_rejects_non_dag_and_conflicts_without_writing_files(
+    store: Store, nodes: list[Node], message: str
+) -> None:
+    invalid = Workflow("bad-flow", "冲突流程", "任务", nodes)
+    with pytest.raises(ValueError, match=message):
+        store.save_workflow(invalid)
+    assert store.list_workflows() == []
+    assert not (store.data_dir / "workflows").exists()

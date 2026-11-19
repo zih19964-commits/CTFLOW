@@ -173,6 +173,8 @@ class Store:
         for node in workflow.nodes:
             _check_id(node.id)
             _check_id(node.worker_id)
+        # 持久化前强制执行完整 DAG 拓扑与节点身份校验，禁止任何带环或冲突的工作流落盘。
+        mermaid = to_mermaid(workflow)
         snapshot = _json(workflow)
         self._save(
             "workflows",
@@ -181,7 +183,7 @@ class Store:
             snapshot,
             {
                 self._path("workflows", f"workflow-{workflow.id}.json"): snapshot,
-                self._path("workflows", f"workflow-{workflow.id}.mmd"): to_mermaid(workflow),
+                self._path("workflows", f"workflow-{workflow.id}.mmd"): mermaid,
             },
         )
 
