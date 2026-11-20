@@ -178,7 +178,7 @@ async def test_stream_passes_model_and_collects_text_usage_without_tools_paramet
         assert body["messages"] == [{"role": "user", "content": "hello"}]
         assert body["stream"] is True
         assert body["enable_thinking"] is False
-        assert body["max_tokens"] == 1200
+        assert body["max_tokens"] == 4096
         assert request.headers["authorization"] == "Bearer fake-key"
         assert "tools" not in body
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=wire)

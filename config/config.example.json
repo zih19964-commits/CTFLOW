@@ -9,8 +9,8 @@
   "extensions_dir": "../extensions",
   "concurrency": 3,
   "timeout": 60,
-  "max_tokens": 1200,
-  "max_tool_rounds": 6,
+  "max_tokens": 4096,
+  "max_tool_rounds": 15,
   "currency": "CNY",
   "prices": {},
   "architect": {

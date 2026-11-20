@@ -67,26 +67,27 @@ def seed_flow_examples(store: Store, template: Worker) -> None:
 
 
 def seed_examples(store: Store, model: str) -> None:
-    """在空数据目录初始化默认示例角色与工作流；连接留空由用户在界面配置。"""
-    if store.list_workers() or store.list_workflows():
-        return
-    bundle = _load_preset_bundle()
-    base_workers = [
-        Worker(item["id"], item["name"], model, item["prompt"])
-        for item in bundle["workers"]
-        if item["id"] not in _FLOW_WORKER_IDS
-    ]
-    for w in base_workers:
-        store.save_worker(w)
-    for item in bundle["workflows"]:
-        if item["id"] == "review":
-            wf = Workflow(
-                id=item["id"],
-                name=item["name"],
-                task=item["task"],
-                nodes=[Node(**n) for n in item["nodes"]],
-            )
-            wf.source = to_mermaid(wf)
-            store.save_workflow(wf)
-    judge = next(w for w in base_workers if w.id == "judge")
-    seed_flow_examples(store, judge)
+    """在空数据目录初始化默认示例角色与工作流；加跨进程写入锁防止多开首次启动竞态。"""
+    with store.write_lock():
+        if store.list_workers() or store.list_workflows():
+            return
+        bundle = _load_preset_bundle()
+        base_workers = [
+            Worker(item["id"], item["name"], model, item["prompt"])
+            for item in bundle["workers"]
+            if item["id"] not in _FLOW_WORKER_IDS
+        ]
+        for w in base_workers:
+            store.save_worker(w)
+        for item in bundle["workflows"]:
+            if item["id"] == "review":
+                wf = Workflow(
+                    id=item["id"],
+                    name=item["name"],
+                    task=item["task"],
+                    nodes=[Node(**n) for n in item["nodes"]],
+                )
+                wf.source = to_mermaid(wf)
+                store.save_workflow(wf)
+        judge = next(w for w in base_workers if w.id == "judge")
+        seed_flow_examples(store, judge)

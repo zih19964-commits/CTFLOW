@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ctflow"
-version = "0.1.0"
+version = "0.2.0"
 description = "用可复用 Worker 和依赖图编排 AI 任务的本地终端工作台"
 requires-python = ">=3.11"
 dependencies = [

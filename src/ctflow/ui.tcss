@@ -10,6 +10,11 @@ Screen {
     link-style: none;
 }
 
+Screen > .screen--selection {
+    background: #2f4f85;
+    color: #ffffff;
+}
+
 Static {
     link-style: none;
     link-style-hover: none;

@@ -367,3 +367,26 @@ def test_examples_are_idempotent_and_have_three_stages(store: Store) -> None:
     store.save_worker(changed)
     seed_examples(store, "another-model")
     assert store.get_worker(changed.id) == changed
+
+
+def test_optimistic_concurrency_and_reentrant_write_lock(
+    store: Store, worker: Worker, workflow: Workflow
+) -> None:
+    """验证乐观并发控制（expected_mtime）可拦截多开旧副本盲覆盖，且进程锁支持同实例可重入。"""
+    with store.write_lock():
+        store.save_worker(worker)
+        mtime1 = store.save_workflow(workflow)
+    assert mtime1 == store.workflow_mtime(workflow.id)
+
+    # 模拟另一个实例抢先修改了同一工作流
+    external = replace(workflow, task="外部新实例已修改的任务")
+    time_ns_after = store.save_workflow(external)
+    if time_ns_after == mtime1:
+        # 极端高并发下同纳秒时人工推进 mtime 确保区分
+        wf_path = store.data_dir / "workflows" / f"workflow-{workflow.id}.json"
+        os.utime(wf_path, ns=(mtime1 + 1_000_000, mtime1 + 1_000_000))
+
+    stale = replace(workflow, task="本实例过期的内存修改")
+    with pytest.raises(ValueError, match="已被外部实例或编排助手更新"):
+        store.save_workflow(stale, expected_mtime=mtime1)
+    assert store.get_workflow(workflow.id).task == "外部新实例已修改的任务"

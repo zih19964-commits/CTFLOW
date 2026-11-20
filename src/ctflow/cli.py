@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
 
 from rich.console import Console
 
-from ctflow.architect import get_architect_worker
+from ctflow.architect import ArchitectTools, get_architect_worker
 from ctflow.config import PROJECT_ROOT, Settings, load_settings, resolve_config_path
 from ctflow.engine import Engine
 from ctflow.examples import seed_examples
@@ -111,8 +112,8 @@ def initialize_config(path: Path) -> None:
             "extensions_dir": "../extensions" if is_config_subdir else "extensions",
             "concurrency": 3,
             "timeout": 60,
-            "max_tokens": 1200,
-            "max_tool_rounds": 6,
+            "max_tokens": 4096,
+            "max_tool_rounds": 15,
             "currency": "CNY",
             "prices": {},
             "architect": {
@@ -183,6 +184,9 @@ async def execute_cli(args: argparse.Namespace, store: Store, settings: Settings
         return 0
     if args.command == "doctor":
         print(settings.safe_summary())
+        npx_state = "已就绪" if shutil.which("npx") else "未安装"
+        uvx_state = "已就绪" if shutil.which("uvx") else "未安装"
+        print(f"外置工具启动器：npx {npx_state} · uvx {uvx_state}")
         print(f"已登记 MCP 服务器：{', '.join(sorted(settings.mcp_servers)) or '无'}")
         if args.worker:
             targets = [_resolve_worker(store, settings, args.worker)]
@@ -219,7 +223,12 @@ async def execute_cli(args: argparse.Namespace, store: Store, settings: Settings
         if not worker.mcp_servers:
             print(f"Worker {worker.id} 未装配 MCP 服务器")
             return 0
-        async with MCPTools(settings, worker) as tools:
+        ctx = (
+            ArchitectTools(settings, store, worker)
+            if worker.id == ARCHITECT_ID
+            else MCPTools(settings, worker)
+        )
+        async with ctx as tools:
             for schema in tools.schemas:
                 print(f"{schema['name']}\t{schema.get('description', '')}")
         return 0

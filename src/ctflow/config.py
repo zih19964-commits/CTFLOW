@@ -109,8 +109,8 @@ class Settings:
     models: list[str] = field(default_factory=lambda: ["qwen3.8-max", "qwen3.8-flash"])
     concurrency: int = 3
     timeout: float = 60
-    max_tokens: int = 1200
-    max_tool_rounds: int = 6
+    max_tokens: int = 4096
+    max_tool_rounds: int = 15
     currency: str = "CNY"
     prices: dict[str, dict[str, float]] = field(default_factory=dict)
     mcp_servers: dict[str, dict] = field(default_factory=dict, repr=False)
@@ -222,7 +222,9 @@ def load_settings(path: Path | None = None) -> Settings:
 def save_architect_connection(
     settings: Settings, *, model: str, base_url: str, extra_body: dict
 ) -> None:
-    """将独立隔离的 @architect 模型连接写回 config.json（API Key 独立保存在 keyring）。"""
+    """将独立隔离的 @architect 模型连接原子写回 config.json（API Key 独立保存在 keyring）。"""
+    from ctflow.storage import write_text_atomic
+
     settings.architect = {
         "name": settings.architect.get("name", "编排助手"),
         "model": model,
@@ -233,6 +235,7 @@ def save_architect_connection(
         return
     raw = json.loads(settings.config_path.read_text(encoding="utf-8"))
     raw["architect"] = dict(settings.architect)
-    settings.config_path.write_text(
-        json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    write_text_atomic(
+        settings.config_path,
+        json.dumps(raw, ensure_ascii=False, indent=2) + "\n",
     )

@@ -41,6 +41,12 @@ async def test_mcp_stdio_lists_and_calls_tool(tmp_path):
         assert tools.schemas[0]["parameters"]["properties"]["text"]["type"] == "string"
         assert await tools.call("mcp_echo_echo", {"text": "hello"}) == "MCP: hello"
 
+    # 验证 tool_filter 白名单裁剪
+    async with MCPTools(
+        mcp_settings(tmp_path), echo_worker(), tool_filter=frozenset({"other"})
+    ) as filtered:
+        assert filtered.schemas == []
+
 
 class ToolClient:
     def __init__(self):

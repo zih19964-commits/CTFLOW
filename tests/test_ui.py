@@ -1723,3 +1723,68 @@ async def test_hub_preview_four_layer_and_partial_adjacent_dag_cards(workbench, 
     rendered = graph(parallel_tracks, {}, "A", 64, 0, interactive=False, compact=True).plain
     assert "╭" in rendered and "├" in rendered and "▸" in rendered
     assert "L1 起点 ─→" not in rendered
+
+
+async def test_partial_reply_selection_copy_and_external_workflow_hot_sync(workbench):
+    """验证鼠标框选局部回复可通过 Ctrl+C / /copy 复制（含脱敏），且多开支持热同步与冲突拦截。"""
+    import os
+
+    from textual.geometry import Offset
+
+    store, settings, workflow = workbench
+
+    class SnippetClient:
+        async def stream(self, model, messages, on_text):
+            reply_text = "前导说明：可框选核心结论片段（密钥 test-writer-secret）用于引用。"
+            on_text(reply_text)
+            return Reply(reply_text, usage=Usage(6, 8), status="completed")
+
+    app = CTFlowApp(store, settings, workflow, client=SnippetClient())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await command(pilot, app, "/chat writer")
+        await command(pilot, app, "请给出一段结论")
+        await asyncio.wait_for(app._chat_task, 3)
+        await pilot.pause()
+
+        chat_static = app.root.query_one("#chat-pane Static", Static)
+        rendered_lines = str(chat_static.render()).splitlines()
+        target_row = next(
+            i for i, line in enumerate(rendered_lines) if "可框选核心结论片段" in line
+        )
+
+        # 焦点保持在底部输入框时，在对话面板框选其中一段文字并按 Ctrl+C 复制（全角字符占 2 列）
+        assert app.root.query_one("#prompt", Input).has_focus
+        await pilot.mouse_down("#chat-pane Static", offset=Offset(16, target_row))
+        await pilot.mouse_up("#chat-pane Static", offset=Offset(24, target_row))
+        await pilot.pause()
+        selected = app.screen.get_selected_text()
+        assert selected and "核心结论" in selected and "前导说明" not in selected
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app.clipboard == selected
+        assert "已复制选中文字" in app.message
+
+        # 框选包含密钥的局部片段并用 /copy 复制，验证局部选区优先且自动脱敏
+        await pilot.mouse_down("#chat-pane Static", offset=Offset(0, target_row))
+        await pilot.mouse_up("#chat-pane Static", offset=Offset(60, target_row))
+        await pilot.pause()
+        app.copy_latest_output()
+        assert "test-writer-secret" not in app.clipboard
+        assert "[密钥已隐藏]" in app.clipboard
+
+        # 模拟外部多开实例修改了磁盘上的当前工作流：直接保存旧副本会拦截，切回工作台自动热同步
+        ext_wf = deepcopy(workflow)
+        ext_wf.task = "多开外部实例写入的新总任务"
+        prev_mtime = app._workflow_mtime
+        new_mtime = store.save_workflow(ext_wf)
+        if new_mtime == prev_mtime and prev_mtime is not None:
+            wf_path = store.data_dir / "workflows" / f"workflow-{workflow.id}.json"
+            os.utime(wf_path, ns=(prev_mtime + 1_000_000, prev_mtime + 1_000_000))
+
+        with pytest.raises(ValueError, match="已被外部实例或编排助手更新"):
+            app.save_workflow(deepcopy(app.workflow))
+
+        app.action_open_workbench()
+        await pilot.pause()
+        assert app.workflow.task == "多开外部实例写入的新总任务"

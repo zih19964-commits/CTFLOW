@@ -37,13 +37,24 @@ class SingleRequestRuntime:
         reply = await self.client.stream(model, messages, on_text)
         if reply.tool_calls:
             raise RuntimeResponseError("单次请求运行不支持工具响应", reply)
+        if reply.status == "length":
+            raise RuntimeResponseError(
+                "模型输出达到 max_tokens 上限被截断（status='length'），请调大 max_tokens", reply
+            )
         if reply.status != "completed" or not reply.content.strip():
             raise RuntimeResponseError(f"模型未返回完整结果（status={reply.status!r}）", reply)
         return reply
 
 
+def _is_mutating_tool(name: str) -> bool:
+    lowered = name.lower()
+    return any(
+        kw in lowered for kw in ("write", "edit", "move", "create", "delete", "save", "remove")
+    )
+
+
 class ToolRuntime:
-    """多步 ToolCall 循环：同轮并行调用 MCP 工具，并在配额临近/耗尽时执行三级渐进收敛。"""
+    """多步 ToolCall 循环：只读工具并行、写工具串行，并在配额临近/耗尽时执行三级渐进收敛。"""
 
     def __init__(
         self,
@@ -59,6 +70,7 @@ class ToolRuntime:
         self.on_tool = on_tool
         self.on_tool_step = on_tool_step
         self.recover_tool_errors = recover_tool_errors
+        self._write_lock = asyncio.Lock()
 
     def _tool_event(self, event: str, name: str, detail: str = "") -> None:
         if self.on_tool:
@@ -74,6 +86,7 @@ class ToolRuntime:
         call: dict,
         step_no: int,
         round_index: int,
+        reply_status: str = "",
     ) -> tuple[dict, str, dict]:
         name = call.get("name", "")
         raw_arguments = call.get("arguments") or "{}"
@@ -102,10 +115,19 @@ class ToolRuntime:
                 try:
                     arguments = json.loads(raw_arguments)
                 except json.JSONDecodeError as error:
+                    if reply_status == "length":
+                        raise ValueError(
+                            f"模型输出达到 max_tokens 上限被截断，导致工具 {name} 参数残缺；"
+                            "请精简单次写入内容或调大 config.json 中的 max_tokens"
+                        ) from error
                     raise ValueError(f"工具 {name} 的参数不是合法 JSON") from error
             if not isinstance(arguments, dict):
                 raise ValueError(f"工具 {name} 的参数必须是 JSON 对象")
-            result = await tools.call(name, arguments)
+            if _is_mutating_tool(name):
+                async with self._write_lock:
+                    result = await tools.call(name, arguments)
+            else:
+                result = await tools.call(name, arguments)
         except Exception as error:
             duration_ms = int((time.perf_counter() - started) * 1000)
             err_text = str(error)
@@ -173,6 +195,11 @@ class ToolRuntime:
             if not reply.tool_calls:
                 reply.usage = total
                 reply.tool_steps = list(tool_steps)
+                if reply.status == "length":
+                    raise RuntimeResponseError(
+                        "模型输出达到 max_tokens 上限被截断（status='length'），请调大 max_tokens",
+                        reply,
+                    )
                 if reply.status != "completed" or not reply.content.strip():
                     raise RuntimeResponseError(
                         f"模型未返回完整结果（status={reply.status!r}）", reply
@@ -182,7 +209,11 @@ class ToolRuntime:
             batch = []
             for call in reply.tool_calls:
                 step_counter += 1
-                batch.append(self._invoke_one(tools, call, step_counter, round_index))
+                batch.append(
+                    self._invoke_one(
+                        tools, call, step_counter, round_index, reply_status=reply.status
+                    )
+                )
             outcomes = await asyncio.gather(*batch)
 
             results: list[tuple[dict, str]] = []

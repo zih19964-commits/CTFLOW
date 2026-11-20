@@ -212,23 +212,47 @@ async def test_architect_isolation_inventory_backup_and_mermaid_extract(tmp_path
     assert '<workflow id="demo"' in arch.prompt
     assert not (store.data_dir / "workers" / "worker-architect.json").exists()
 
-    # 2. ArchitectTools 在执行写类工具前自动在隔离区创建备份快照
+    # 2. ArchitectTools 网关：路径归一化、写前备份、非法内容当场回退，合法修改可一键 /rollback
     tools = ArchitectTools(settings, store, arch)
+    payload_to_write = "{corrupted json"
+
+    def write_payload(target: str) -> None:
+        Path(target).write_text(payload_to_write, encoding="utf-8")
 
     class FakeMCP:
         async def call(self, name: str, arguments: dict) -> str:
-            (store.data_dir / "workflows" / "workflow-demo.json").write_text(
-                "{corrupted json", encoding="utf-8"
-            )
+            write_payload(arguments["path"])
             return "written"
 
     tools._mcp = FakeMCP()  # type: ignore[assignment]
-    await tools.call("mcp_architect_fs_write_file", {"path": "workflow-demo.json"})
+    with pytest.raises(ValueError, match="未通过 CTflow 数据契约校验"):
+        await tools.call("mcp_architect_fs_write_file", {"path": "workflows/workflow-demo.json"})
     assert list(settings.backup_dir.glob("snap-*"))
+    assert store.get_workflow("demo").name == "示例流"
 
-    # 坏文件被自动跳过不崩主程序，且 rollback_latest 一键完整还原
-    assert store.list_workflows() == []
-    assert "workflows/workflow-demo.json" in store.corrupted_files
+    # 包裹外层 {"content": ...} 同样被网关拦截并回退
+    payload_to_write = '{"content": {"id": "demo", "name": "被包裹", "task": "t", "nodes": []}}'
+    with pytest.raises(ValueError, match="包裹 content 对象"):
+        await tools.call(
+            "mcp_architect_fs_write_file", {"path": "data/workflows/workflow-demo.json"}
+        )
+    assert store.get_workflow("demo").name == "示例流"
+
+    # 越界访问外部路径立即拒绝
+    with pytest.raises(ValueError, match="仅允许访问受管目录"):
+        await tools.call(
+            "mcp_architect_fs_read_text_file", {"path": str(tmp_path / "outside.json")}
+        )
+
+    # 合法写入通过校验落盘，且可用 rollback_latest 一键还原至写前快照
+    payload_to_write = (
+        '{"id": "demo", "name": "网关改名流", "task": "新任务", '
+        '"nodes": [{"id": "A", "label": "起点", "worker_id": "judge", '
+        '"task": "", "dependencies": []}]}'
+    )
+    await tools.call("mcp_architect_fs_write_file", {"path": "workflows/workflow-demo.json"})
+    assert store.get_workflow("demo").name == "网关改名流"
+
     restored_msg = store.rollback_latest()
     assert "1 套工作流" in restored_msg
     assert store.get_workflow("demo").name == "示例流"
@@ -237,3 +261,64 @@ async def test_architect_isolation_inventory_backup_and_mermaid_extract(tmp_path
     # 3. 提取回复中的 mermaid 代码块
     md_reply = '好的，为你设计如下：\n\n```mermaid\nflowchart TD\n    A["审核 @judge"]\n```\n'
     assert extract_mermaid_source(md_reply) == 'flowchart TD\n    A["审核 @judge"]'
+
+
+async def test_write_tools_serialize_and_length_truncation_is_reported(tmp_path: Path):
+    """验证同轮多个写工具按锁串行执行，且模型输出被 max_tokens 截断时返回明确诊断。"""
+    active_writes = 0
+    peak_writes = 0
+
+    class WriteTools:
+        schemas = [
+            {
+                "name": "mcp_fs_write_file",
+                "description": "写文件",
+                "parameters": {"type": "object", "properties": {"p": {"type": "string"}}},
+            }
+        ]
+
+        async def call(self, name: str, arguments: dict) -> str:
+            nonlocal active_writes, peak_writes
+            active_writes += 1
+            peak_writes = max(peak_writes, active_writes)
+            await asyncio.sleep(0.02)
+            active_writes -= 1
+            return "ok"
+
+    class TruncatedThenFixedClient:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        def append_tool_round(self, messages, reply, results):
+            messages.append({"role": "assistant", "content": None})
+            for call, res in results:
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": res})
+
+        async def stream(self, model, messages, on_text, tools=None):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                return Reply(
+                    tool_calls=[
+                        {"id": "w1", "name": "mcp_fs_write_file", "arguments": '{"p": "half'},
+                    ],
+                    usage=Usage(5, 5),
+                    status="length",
+                )
+            if len(self.calls) == 2:
+                assert "max_tokens 上限被截断" in messages[-1]["content"]
+                return Reply(
+                    tool_calls=[
+                        {"id": "w2", "name": "mcp_fs_write_file", "arguments": '{"p": "a"}'},
+                        {"id": "w3", "name": "mcp_fs_write_file", "arguments": '{"p": "b"}'},
+                    ],
+                    usage=Usage(5, 5),
+                    status="tool_calls",
+                )
+            on_text("写入完成")
+            return Reply("写入完成", usage=Usage(4, 3), status="completed")
+
+    reply = await ToolRuntime(TruncatedThenFixedClient(), 15).execute(
+        "m1", [{"role": "user", "content": "写配置"}], lambda _: None, WriteTools()
+    )
+    assert peak_writes == 1
+    assert reply.content == "写入完成"

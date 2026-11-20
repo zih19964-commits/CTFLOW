@@ -1,30 +1,46 @@
-"""独立物理隔离的内置编排服务者 @architect：写死项目规范、窄白名单 MCP 与写前自动快照。"""
+"""独立物理隔离的内置编排服务者 @architect：写死项目规范、白名单 MCP 网关守卫与写前自动快照。"""
 
 from __future__ import annotations
 
 import shutil
+from pathlib import Path
 
 from ctflow.config import Settings
 from ctflow.mcp_tools import MCPTools
 from ctflow.models import ARCHITECT_ID, Worker
 from ctflow.secrets import SecretBox
-from ctflow.storage import Store
+from ctflow.storage import Store, write_text_atomic
 from ctflow.tools import discover_skills
 
 ARCHITECT_SERVER_KEY = "architect_fs"
+ARCHITECT_ALLOWED_TOOLS = frozenset(
+    {
+        "read_text_file",
+        "read_multiple_files",
+        "write_file",
+        "edit_file",
+        "list_directory",
+    }
+)
 
 ARCHITECT_SYSTEM_SPEC = """\
 你是 CTflow 的内置编排服务者（@architect），负责根据用户需求创建或优化 Worker 角色与 DAG 工作流。
 
 ### 1. CTflow 核心概念与约束
-- **Worker**：可复用的角色方案，保存在 `workers/worker-<id>.json`（ID 限字母、数字、下划线或连字符，
-  禁止使用保留名 `architect`）。API Key 由系统凭据库保管，JSON 文件内严禁出现 `api_key` 字段。
+- **Worker**：可复用的角色方案，保存在 `<managed_paths>` 的 `workers/worker-<id>.json`
+  （ID 限字母、数字、下划线或连字符，禁止使用保留名 `architect`）。
+  API Key 由系统凭据库保管，JSON 文件内严禁出现 `api_key` 字段。
 - **Node**：工作流中的任务实例，包含 `id`（如 `A`、`B`）、`label`（简短标题）、`worker_id`
   （引用已有 Worker ID，不带 `@`）、`task`（节点补充任务）与 `dependencies`（直接上游列表）。
-- **Workflow**：由多个 Node 组成的有向无环图（DAG），保存在 `workflows/workflow-<id>.json`。
-  严禁自环或循环依赖；每次运行各节点上下文独立，仅接收直接上游节点的最终结论。
+- **Workflow**：由多个 Node 组成的有向无环图（DAG），保存在 `<managed_paths>` 的
+  `workflows/workflow-<id>.json`。严禁自环或循环依赖；若引用了新角色，请先落盘对应的
+  `workers/worker-<id>.json` 再写工作流文件。
 
-### 2. 纯文件数据契约
+### 2. 纯文件数据契约与写入要求
+调用 `write_file` 工具时，`path` 请优先填写 `<managed_paths>` 给出的完整目录路径拼接文件名
+（如 `<workflows_dir>/workflow-<id>.json`），`content` 参数必须是序列化后的 JSON 字符串，
+且文件顶层直接为下述字段（严禁在文件内容外层再包裹 `{"content": ...}`）：
+
 1) `workers/worker-<id>.json` 格式：
 ```json
 {
@@ -63,7 +79,7 @@ ARCHITECT_SYSTEM_SPEC = """\
       "dependencies": ["A"]
     }
   ],
-  "source": "flowchart TD\\n    A[\\"调研 @research\\"] --> B[\\"裁决 @judge\\"]"
+  "source": "flowchart TD\\n    A[\\"资料调研 @research\\"] --> B[\\"综合裁决 @judge\\"]"
 }
 ```
 
@@ -145,7 +161,7 @@ def get_architect_worker(
 
 
 class ArchitectTools:
-    """为 @architect 挂载窄白名单 filesystem MCP，并在写操作前自动备份快照。"""
+    """为 @architect 挂载过滤后的 filesystem MCP，并提供路径归一化、锁内快照与写后契约校验。"""
 
     def __init__(self, settings: Settings, store: Store, worker: Worker) -> None:
         self.settings = settings
@@ -155,8 +171,46 @@ class ArchitectTools:
         self._mcp: MCPTools | None = None
         self._backed_up = False
 
+    def _resolve_managed_path(self, raw_path: str) -> Path:
+        """将模型传入的相对路径或绝对路径统一归一化到受管目录，越界立即拦截。"""
+        workers_dir = (self.store.data_dir / "workers").resolve()
+        workflows_dir = (self.store.data_dir / "workflows").resolve()
+        cleaned = raw_path.strip().replace("\\", "/")
+        if not cleaned:
+            raise ValueError("文件路径不能为空")
+
+        if cleaned in {"workers", "workers/", "data/workers", "data/workers/"}:
+            candidate = workers_dir
+        elif cleaned in {"workflows", "workflows/", "data/workflows", "data/workflows/"}:
+            candidate = workflows_dir
+        elif cleaned.startswith("workers/"):
+            candidate = (workers_dir / cleaned[len("workers/") :]).resolve()
+        elif cleaned.startswith("workflows/"):
+            candidate = (workflows_dir / cleaned[len("workflows/") :]).resolve()
+        elif cleaned.startswith("data/workers/"):
+            candidate = (workers_dir / cleaned[len("data/workers/") :]).resolve()
+        elif cleaned.startswith("data/workflows/"):
+            candidate = (workflows_dir / cleaned[len("data/workflows/") :]).resolve()
+        elif "/" not in cleaned and ":" not in cleaned:
+            if cleaned.startswith("workflow-"):
+                candidate = (workflows_dir / cleaned).resolve()
+            else:
+                candidate = (workers_dir / cleaned).resolve()
+        else:
+            candidate = Path(raw_path.strip()).resolve()
+
+        if not (candidate.is_relative_to(workers_dir) or candidate.is_relative_to(workflows_dir)):
+            raise ValueError(
+                f"编排助手仅允许访问受管目录 {workers_dir.as_posix()} 与 "
+                f"{workflows_dir.as_posix()}，拒绝路径：{raw_path}"
+            )
+        return candidate
+
     async def __aenter__(self) -> ArchitectTools:
         if not self.worker.mcp_servers:
+            return self
+        npx_cmd = shutil.which("npx")
+        if not npx_cmd:
             return self
         workers_dir = (self.store.data_dir / "workers").resolve()
         workflows_dir = (self.store.data_dir / "workflows").resolve()
@@ -165,7 +219,7 @@ class ArchitectTools:
         extra = {
             ARCHITECT_SERVER_KEY: {
                 "transport": "stdio",
-                "command": "npx",
+                "command": npx_cmd,
                 "args": [
                     "-y",
                     "@modelcontextprotocol/server-filesystem",
@@ -174,7 +228,12 @@ class ArchitectTools:
                 ],
             }
         }
-        self._mcp = MCPTools(self.settings, self.worker, extra_servers=extra)
+        self._mcp = MCPTools(
+            self.settings,
+            self.worker,
+            extra_servers=extra,
+            tool_filter=ARCHITECT_ALLOWED_TOOLS,
+        )
         await self._mcp.__aenter__()
         self.schemas = list(self._mcp.schemas)
         return self
@@ -182,14 +241,41 @@ class ArchitectTools:
     async def call(self, name: str, arguments: dict) -> str:
         if self._mcp is None:
             raise ValueError("编排助手未启用文件系统 MCP")
-        # 首次调用任何写/改/建目录类工具前自动创建隔离快照，确保一键 /rollback 可恢复。
+        normalized = dict(arguments)
+        target_path: Path | None = None
+        if isinstance(normalized.get("path"), str):
+            target_path = self._resolve_managed_path(normalized["path"])
+            normalized["path"] = str(target_path)
+        elif isinstance(normalized.get("paths"), list):
+            normalized["paths"] = [
+                str(self._resolve_managed_path(str(item))) for item in normalized["paths"]
+            ]
+
         lowered = name.lower()
-        if not self._backed_up and any(
-            kw in lowered for kw in ("write", "edit", "move", "create", "delete")
-        ):
-            self.store.create_backup()
-            self._backed_up = True
-        return await self._mcp.call(name, arguments)
+        is_mutating = any(kw in lowered for kw in ("write", "edit", "move", "create", "delete"))
+        if not is_mutating:
+            return await self._mcp.call(name, normalized)
+
+        # 写操作全程受跨进程锁保护：首次写前自动备份，写后立即执行 Store 契约校验，不合法当场还原。
+        with self.store.write_lock():
+            if not self._backed_up:
+                self.store.create_backup()
+                self._backed_up = True
+            existed = target_path is not None and target_path.is_file()
+            prior_bytes = target_path.read_bytes() if existed and target_path is not None else None
+            result = await self._mcp.call(name, normalized)
+            if target_path is not None:
+                try:
+                    self.store.validate_managed_file(target_path)
+                except ValueError as exc:
+                    if existed and prior_bytes is not None:
+                        write_text_atomic(target_path, prior_bytes.decode("utf-8"))
+                    elif target_path.exists():
+                        target_path.unlink(missing_ok=True)
+                    raise ValueError(
+                        f"写入内容未通过 CTflow 数据契约校验（已自动撤销改动）：{exc}"
+                    ) from exc
+            return result
 
     async def __aexit__(self, *exc: object) -> None:
         if self._mcp is not None:

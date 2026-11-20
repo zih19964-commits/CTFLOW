@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import math
+import sys
 import time
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from rich.console import Group
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.style import Style
@@ -20,6 +22,7 @@ from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
@@ -104,6 +107,96 @@ def _link(label: str, action: str, color: str = BLUE, *, bold: bool = False) -> 
     return (label, Style(color=color, bold=bold, meta={"@click": f"app.{action}"}))
 
 
+def _copy_windows_clipboard(text: str) -> None:
+    """Windows 真实终端下直写系统剪贴板（CF_UNICODETEXT），补充不支持 OSC 52 的宿主。"""
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+        user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+
+        encoded = text.encode("utf-16-le") + b"\x00\x00"
+        h_mem = kernel32.GlobalAlloc(0x0002, len(encoded))
+        if not h_mem:
+            return
+        ptr = kernel32.GlobalLock(h_mem)
+        if not ptr:
+            kernel32.GlobalFree(h_mem)
+            return
+        try:
+            ctypes.memmove(ptr, encoded, len(encoded))
+        finally:
+            kernel32.GlobalUnlock(h_mem)
+
+        if not user32.OpenClipboard(None):
+            kernel32.GlobalFree(h_mem)
+            return
+        try:
+            user32.EmptyClipboard()
+            if not user32.SetClipboardData(13, h_mem):
+                kernel32.GlobalFree(h_mem)
+        finally:
+            user32.CloseClipboard()
+    except OSError:
+        pass
+
+
+def _renderable_to_text(console: Console, renderable: object, width: int) -> Text:
+    """将 Group / Markdown 等复合 Rich 组件转为带样式的 Text，使 Textual 原生支持鼠标框选复制。"""
+    if isinstance(renderable, Text):
+        return renderable
+    opts = console.options.update(highlight=False, width=max(20, width))
+    lines = console.render_lines(renderable, opts, pad=False, new_lines=False)  # type: ignore[arg-type]
+    out = Text()
+    for idx, segs in enumerate(lines):
+        if idx:
+            out.append("\n")
+        for chunk, seg_style, _ in segs:
+            if chunk:
+                out.append(chunk, seg_style)
+    return out
+
+
+class SelectableStatic(Static):
+    """支持鼠标框选局部文字高亮与 Ctrl+C 复制的内容画布。"""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._cached_selection_visual: tuple[int, int, Content] | None = None
+
+    def update(self, content: object = "", *, layout: bool = True) -> None:
+        self._cached_selection_visual = None
+        super().update(content, layout=layout)  # type: ignore[arg-type]
+
+    def on_resize(self) -> None:
+        if not isinstance(self.content, (str, Text, Content)):
+            self._cached_selection_visual = None
+            self.refresh(layout=True)
+
+    def render(self):
+        raw = self.content
+        if isinstance(raw, (str, Text, Content)):
+            return super().render()
+        width = self.content_size.width or self.size.width or max(20, self.app.size.width - 8)
+        cache = self._cached_selection_visual
+        if cache is not None and cache[0] == id(raw) and cache[1] == width:
+            return cache[2]
+        text = _renderable_to_text(self.app.console, raw, width)
+        visual = Content.from_rich_text(text, console=self.app.console)
+        visual._renderable = raw  # type: ignore[attr-defined]
+        self._cached_selection_visual = (id(raw), width, visual)
+        return visual
+
+
 class HubOptionList(OptionList):
     """Hub 选择页列表：Enter 直接进入，鼠标单击仅高亮切换预览（双击由 App 处理进入）。"""
 
@@ -115,7 +208,7 @@ class HubOptionList(OptionList):
 
 class Pane(VerticalScroll):
     def compose(self) -> ComposeResult:
-        yield Static(classes="content", markup=False)
+        yield SelectableStatic(classes="content", markup=False)
 
     def show_content(self, content: object, *, follow: bool = False) -> None:
         at_bottom = self.scroll_y >= self.max_scroll_y - 1
@@ -151,7 +244,7 @@ class CommandInput(Input):
 COMMANDS = [
     ("/hub", "返回工作流与 Worker 选择页（快捷键 ←）"),
     ("/chat", "进入单 Worker 独立对话 · /chat architect 召唤编排助手"),
-    ("/copy", "复制最后回答或工作流最终结果"),
+    ("/copy", "复制鼠标选中文字、最后回答或工作流最终结果（快捷键 Ctrl+C）"),
     ("/clear (new)", "单聊模式下开启新对话"),
     ("/worker", "选择 Worker 配置 · /worker architect 配置助手连接"),
     ("/worker new", "新增 Worker"),
@@ -210,6 +303,10 @@ class CTFlowApp(App[None]):
         self.store, self.settings, self.client = store, settings, client
         workflows = store.list_workflows()
         self.workflow = deepcopy(workflow) if workflow else (workflows[0] if workflows else None)
+        self._workflow_mtime: int | None = (
+            store.workflow_mtime(self.workflow.id) if self.workflow else None
+        )
+        self._in_explicit_copy = False
         self.auto_run = auto_run
         self.page = "hub" if (start_in_hub and not auto_run) else "workbench"
         self.hub_tab = "workflows"
@@ -349,6 +446,8 @@ class CTFlowApp(App[None]):
 
     def tick(self) -> None:
         if self.busy or self.chat_busy:
+            if self._ui_ready and self.screen.selections:
+                return
             self.frame += 1
             self.render_current()
 
@@ -424,8 +523,21 @@ class CTFlowApp(App[None]):
         else:
             pane.scroll_page_down(animate=False)
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """统一剪贴板出口：自动脱敏密钥、同步 Windows 原生剪贴板，并对鼠标框选 Ctrl+C 给出反馈。"""
+        clean = self.redact(text)
+        super().copy_to_clipboard(clean)
+        if sys.platform == "win32" and not self.is_headless:
+            _copy_windows_clipboard(clean)
+        if self._ui_ready and not self._in_explicit_copy and clean:
+            self.set_message(f"已复制选中文字（{len(clean)} 字符）")
+
     def _write_clipboard(self, text: str) -> None:
-        self.copy_to_clipboard(text)
+        self._in_explicit_copy = True
+        try:
+            self.copy_to_clipboard(text)
+        finally:
+            self._in_explicit_copy = False
 
     def set_message(self, text: str, *, error: bool = False) -> None:
         self.message = self.redact(text)
@@ -458,10 +570,45 @@ class CTFlowApp(App[None]):
             raise ValueError("请先 /worker new 配置 Worker，再 /flow new 创建工作流")
         return self.workflow
 
+    def _sync_external_workflows(self) -> None:
+        """检测外部多开实例或 @architect 落盘改动，自动热更新内存工作流状态。"""
+        if self.busy:
+            return
+        if self.workflow is not None:
+            disk_mtime = self.store.workflow_mtime(self.workflow.id)
+            if disk_mtime is not None and disk_mtime != self._workflow_mtime:
+                try:
+                    self.workflow = self.store.get_workflow(self.workflow.id)
+                    self._workflow_mtime = disk_mtime
+                    if self.selected_node not in {n.id for n in self.workflow.nodes}:
+                        self.selected_node = (
+                            self.workflow.nodes[0].id if self.workflow.nodes else ""
+                        )
+                    self._cards_key = ()
+                    self._reading_key = ()
+                except ValueError:
+                    pass
+            elif disk_mtime is None and self._workflow_mtime is not None:
+                workflows = self.store.list_workflows()
+                self.workflow = workflows[0] if workflows else None
+                self._workflow_mtime = (
+                    self.store.workflow_mtime(self.workflow.id) if self.workflow else None
+                )
+                self.selected_node = (
+                    self.workflow.nodes[0].id if self.workflow and self.workflow.nodes else ""
+                )
+        else:
+            workflows = self.store.list_workflows()
+            if workflows:
+                self.workflow = workflows[0]
+                self._workflow_mtime = self.store.workflow_mtime(self.workflow.id)
+                self.selected_node = self.workflow.nodes[0].id if self.workflow.nodes else ""
+
     # ==================== 页面导航动作 ====================
     def action_back_to_hub(self) -> None:
         if len(self.screen_stack) > 1 or self.page == "hub":
             return
+        self._sync_external_workflows()
         self.page = "hub"
         self._apply_page_visibility()
         self.render_hub()
@@ -469,6 +616,7 @@ class CTFlowApp(App[None]):
         self.root.query_one("#hub-list", OptionList).focus()
 
     def action_open_workbench(self) -> None:
+        self._sync_external_workflows()
         self.page = "workbench"
         self._apply_page_visibility()
         prompt = self.root.query_one("#prompt", Input)
@@ -1039,7 +1187,10 @@ class CTFlowApp(App[None]):
 
         validate_workflow(workflow, workers)
         workflow.source = to_mermaid(workflow)
-        self.store.save_workflow(workflow)
+        expected = (
+            self._workflow_mtime if (self.workflow and self.workflow.id == workflow.id) else None
+        )
+        self._workflow_mtime = self.store.save_workflow(workflow, expected_mtime=expected)
         self.workflow, self.view_run, self.view_name = workflow, None, "flow"
         if self.selected_node not in {n.id for n in workflow.nodes}:
             self.selected_node = workflow.nodes[0].id
@@ -1056,6 +1207,7 @@ class CTFlowApp(App[None]):
             return
         self.require_editable()
         self.workflow = self.store.get_workflow(key)
+        self._workflow_mtime = self.store.workflow_mtime(self.workflow.id)
         self.view_run = None
         self.selected_node, self.view_name = self.workflow.nodes[0].id, "flow"
         self.set_message(f"已加载 · {self.workflow.name}")
@@ -1218,6 +1370,8 @@ class CTFlowApp(App[None]):
         finally:
             self.chat_busy = False
             if not self._shutting_down:
+                if worker.id == ARCHITECT_ID:
+                    self._sync_external_workflows()
                 self.render_chat()
 
     def _on_chat_update(self) -> None:
@@ -1497,6 +1651,9 @@ class CTFlowApp(App[None]):
             self.workflow = matched or (workflows[0] if workflows else None)
         else:
             self.workflow = workflows[0] if workflows else None
+        self._workflow_mtime = (
+            self.store.workflow_mtime(self.workflow.id) if self.workflow else None
+        )
         self.selected_node = (
             self.workflow.nodes[0].id if self.workflow and self.workflow.nodes else ""
         )
@@ -1669,6 +1826,14 @@ class CTFlowApp(App[None]):
             self.set_message(str(exc), error=True)
 
     def copy_latest_output(self, target_node: str = "") -> None:
+        if not target_node and self._ui_ready and self.screen.selections:
+            selected = (self.screen.get_selected_text() or "").strip()
+            if selected:
+                clean = self.redact(selected)
+                self._write_clipboard(clean)
+                self.set_message(f"已复制选中文字（{len(clean)} 字符）")
+                return
+
         if self.page == "chat":
             if target_node:
                 raise ValueError("单聊模式下直接输入 /copy 即可复制最后回答")
