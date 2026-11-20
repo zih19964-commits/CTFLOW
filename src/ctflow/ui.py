@@ -327,6 +327,7 @@ class CTFlowApp(App[None]):
             self._splash_timer = self.set_interval(0.04, self._tick_splash)
         self._apply_page_visibility()
         self.render_current()
+        self.call_after_refresh(self.render_current)
         if self.store.corrupted_files:
             bad = ", ".join(self.store.corrupted_files[:2])
             self.set_message(f"发现损坏配置 ({bad})，已自动跳过 · 可用 /rollback 恢复", error=True)
@@ -711,7 +712,8 @@ class CTFlowApp(App[None]):
             preview.show_content(Text(empty_msg, MUTED))
             return
 
-        width = max(36, preview.content_size.width or 56)
+        fallback_width = max(36, int((self.size.width - 2) * 0.58) - 6)
+        width = preview.content_size.width if preview.content_size.width > 0 else fallback_width
         if self.hub_tab == "workflows":
             try:
                 wf = self.store.get_workflow(key)
@@ -725,7 +727,7 @@ class CTFlowApp(App[None]):
             doc.append((wf.task or "未填写总任务") + "\n\n", TEXT)
             doc.append("拓扑结构\n", BLUE)
             try:
-                doc.append_text(graph(wf, {}, "", width, 0, interactive=False))
+                doc.append_text(graph(wf, {}, "", width, 0, interactive=False, compact=True))
             except ValueError as exc:
                 doc.append(f"拓扑冲突，无法显示与运行：{exc}", RED)
             doc.append("\n\n节点装配清单\n", BLUE)

@@ -821,7 +821,13 @@ class FlowEditor(Dialog):
             try:
                 validate_workflow(self.draft_workflow, self.worker_catalog)
                 preview = graph(
-                    self.draft_workflow, {}, self.selected_node_id, width, 0, interactive=False
+                    self.draft_workflow,
+                    {},
+                    self.selected_node_id,
+                    width,
+                    0,
+                    interactive=False,
+                    compact=True,
                 )
             except ValueError as exc:
                 preview = Text(f"拓扑冲突，无法显示与运行：{exc}", RED)

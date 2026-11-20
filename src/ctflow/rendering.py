@@ -518,6 +518,26 @@ class _Grid:
         return result
 
 
+_L, _R, _U, _D = 1, 2, 4, 8
+_JUNCTION_CHARS: dict[int, str] = {
+    _L: "─",
+    _R: "─",
+    _L | _R: "─",
+    _U: "│",
+    _D: "│",
+    _U | _D: "│",
+    _R | _D: "╭",
+    _L | _D: "╮",
+    _R | _U: "╰",
+    _L | _U: "╯",
+    _U | _D | _R: "├",
+    _U | _D | _L: "┤",
+    _L | _R | _D: "┬",
+    _L | _R | _U: "┴",
+    _L | _R | _U | _D: "┼",
+}
+
+
 def graph(
     workflow: Workflow,
     states: dict[str, NodeRun],
@@ -526,22 +546,25 @@ def graph(
     frame: int,
     *,
     interactive: bool = True,
+    compact: bool = False,
 ) -> Text:
-    """绘制圆角字符 DAG 画布；宽屏采用分层卡片与圆角连线，窄屏平滑降级为结构化行视图。"""
+    """绘制圆角字符 DAG 画布；宽屏采用分层卡片与正交连线，窄屏或跨层跳线平滑降级为结构化行视图。"""
     by_id = {node.id: node for node in workflow.nodes}
     layers = [[by_id[key] for key in layer] for layer in topological_layers(workflow)]
-    regular = all(
-        set(node.dependencies) == {parent.id for parent in layers[depth - 1]}
+    depth_of = {node.id: depth for depth, layer in enumerate(layers) for node in layer}
+    adjacent = all(
+        depth_of[dep] == depth - 1
         for depth, layer in enumerate(layers)
         if depth
         for node in layer
+        for dep in node.dependencies
     )
 
     def sty(node_id: str, color: str) -> str | Style:
         return node_style(node_id, color) if interactive else color
 
-    min_card_width = 50 if len(layers) <= 3 else 62
-    if width < min_card_width or len(layers) > 4 or not regular:
+    min_card_width = 50 if len(layers) <= 3 else len(layers) * 10 + (len(layers) - 1) * 4
+    if width < min_card_width or not adjacent:
         result = Text()
         for layer_index, layer in enumerate(layers, start=1):
             for node in layer:
@@ -575,26 +598,43 @@ def graph(
                 result.append_text(state_badge)
         return result
 
-    gap = 5 if width < 66 else 7
+    gap = 0 if len(layers) <= 1 else (4 if width < 62 else 5 if width < 72 else 7)
     box_width = min(24, (width - gap * (len(layers) - 1)) // len(layers))
+    row_step = 4 if compact else 5
     rows = max(len(layer) for layer in layers)
-    grid = _Grid(width, rows * 5 - 1)
+    grid_height = rows * row_step - 1
+    grid = _Grid(width, grid_height)
     positions = {
-        node.id: (column * (box_width + gap), 1 + row * 5 + (rows - len(layer)) * 2)
+        node.id: (
+            column * (box_width + gap),
+            1 + row * row_step + (rows - len(layer)) * 2,
+        )
         for column, layer in enumerate(layers)
         for row, node in enumerate(layer)
     }
 
+    # 以四向位掩码合成汇流/分叉/交叉连线（╭ ╮ ╰ ╯ ├ ┤ ┬ ┴ ┼），消除多分支覆盖断线。
+    wire_mask: dict[tuple[int, int], int] = {}
+    wire_rank: dict[tuple[int, int], int] = {}
+    wire_pulse: dict[tuple[int, int], int] = {}
+    rank_color = {0: LINE, 1: GREEN, 2: BLUE}
+    arrow_rank: dict[tuple[int, int], int] = {}
+
+    def add_wire(x: int, y: int, bits: int, rank: int, pulse_idx: int | None = None) -> None:
+        key = (x, y)
+        wire_mask[key] = wire_mask.get(key, 0) | bits
+        if rank >= wire_rank.get(key, -1):
+            wire_rank[key] = rank
+        if pulse_idx is not None and key not in wire_pulse:
+            wire_pulse[key] = pulse_idx
+
     for target in workflow.nodes:
         tx, ty = positions[target.id]
+        bus = tx - 3
+        x_arrow = tx - 1
         for source_id in target.dependencies:
             sx, sy = positions[source_id]
-            bus = tx - (2 if gap == 5 else 3)
-            route = [(x, sy, "─") for x in range(sx + box_width, bus + 1)]
-            step = 1 if ty >= sy else -1
-            if ty != sy:
-                route.extend((bus, y, "│") for y in range(sy + step, ty + step, step))
-            route.extend((x, ty, "─") for x in range(bus + 1, tx))
+            x0 = sx + box_width
             active = (
                 target.id in states
                 and states[target.id].status == "running"
@@ -605,17 +645,47 @@ def graph(
                 and states[target.id].status == "success"
                 and states[source_id].status == "success"
             )
-            edge_color = BLUE if active else GREEN if done else LINE
-            for index, (x, y, char) in enumerate(route):
-                if active and index % 5 == frame % 5:
-                    char = "›" if char == "─" else "·"
-                grid.put(x, y, char, edge_color)
-            grid.put(tx - 1, ty, "▸", BLUE if active else GREEN if done else ORANGE)
-            if sy != ty:
-                # 圆角拐点，视觉柔和不尖锐。
-                grid.put(bus, sy, "╮" if step > 0 else "╯", edge_color)
-                grid.put(bus, ty, "╰" if step > 0 else "╭", edge_color)
+            rank = 2 if active else 1 if done else 0
+            idx = 0
+            if sy == ty:
+                for x in range(x0, x_arrow):
+                    add_wire(x, sy, _L | _R, rank, idx if active else None)
+                    idx += 1
+            else:
+                step = 1 if ty > sy else -1
+                for x in range(x0, bus):
+                    add_wire(x, sy, _L | _R, rank, idx if active else None)
+                    idx += 1
+                add_wire(bus, sy, _L | (_D if step > 0 else _U), rank)
+                idx += 1
+                for y in range(sy + step, ty, step):
+                    add_wire(bus, y, _U | _D, rank, idx if active else None)
+                    idx += 1
+                add_wire(bus, ty, (_U if step > 0 else _D) | _R, rank)
+                idx += 1
+                for x in range(bus + 1, x_arrow):
+                    add_wire(x, ty, _L | _R, rank, idx if active else None)
+                    idx += 1
+            arrow_key = (x_arrow, ty)
+            if rank >= arrow_rank.get(arrow_key, -1):
+                arrow_rank[arrow_key] = rank
 
+    for (x, y), bits in wire_mask.items():
+        char = _JUNCTION_CHARS.get(bits, "─")
+        pulse_idx = wire_pulse.get((x, y))
+        if pulse_idx is not None and pulse_idx % 5 == frame % 5:
+            if bits == (_L | _R):
+                char = "›"
+            elif bits == (_U | _D):
+                char = "·"
+        grid.put(x, y, char, rank_color[wire_rank[(x, y)]])
+
+    arrow_colors = {0: ORANGE, 1: GREEN, 2: BLUE}
+    for (x, y), rank in arrow_rank.items():
+        grid.put(x, y, "▸", arrow_colors[rank])
+
+    pad = 1 if box_width < 16 else 2
+    inner_w = max(4, box_width - pad * 2)
     for node in workflow.nodes:
         x, y = positions[node.id]
         state = states.get(node.id)
@@ -631,24 +701,34 @@ def graph(
         )
         style = sty(node.id, border_color)
         grid.put(x, y - 1, "╭" + "─" * (box_width - 2) + "╮", style)
-        for offset in (0, 1):
-            grid.put(x, y + offset, "│" + " " * (box_width - 2) + "│", style)
-        grid.put(
-            x + 2,
-            y,
-            fit(f"{node.id} {node.label}", box_width - 4),
-            sty(node.id, BLUE if node.id == selected else TEXT),
-        )
-        if state and state.usage.total_tokens and status == "success":
-            sub_plain = f"✓ {state.usage.total_tokens} tok"
-            sub_color = GREEN
-        elif not state:
-            sub_plain = f"@{node.worker_id}"
-            sub_color = MUTED
+        if compact:
+            grid.put(x, y, "│" + " " * (box_width - 2) + "│", style)
+            grid.put(
+                x + pad,
+                y,
+                fit(f"{node.id} {node.label}", inner_w),
+                sty(node.id, BLUE if node.id == selected else TEXT),
+            )
+            grid.put(x, y + 1, "╰" + "─" * (box_width - 2) + "╯", style)
         else:
-            st = status_text(status, frame)
-            sub_plain = st.plain
-            sub_color = str(st.style)
-        grid.put(x + 2, y + 1, fit(sub_plain, box_width - 4), sty(node.id, sub_color))
-        grid.put(x, y + 2, "╰" + "─" * (box_width - 2) + "╯", style)
+            for offset in (0, 1):
+                grid.put(x, y + offset, "│" + " " * (box_width - 2) + "│", style)
+            grid.put(
+                x + pad,
+                y,
+                fit(f"{node.id} {node.label}", inner_w),
+                sty(node.id, BLUE if node.id == selected else TEXT),
+            )
+            if state and state.usage.total_tokens and status == "success":
+                sub_plain = f"✓ {state.usage.total_tokens} tok"
+                sub_color = GREEN
+            elif not state:
+                sub_plain = f"@{node.worker_id}"
+                sub_color = MUTED
+            else:
+                st = status_text(status, frame)
+                sub_plain = st.plain
+                sub_color = str(st.style)
+            grid.put(x + pad, y + 1, fit(sub_plain, inner_w), sty(node.id, sub_color))
+            grid.put(x, y + 2, "╰" + "─" * (box_width - 2) + "╯", style)
     return grid.render()

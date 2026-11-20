@@ -1687,3 +1687,39 @@ async def test_dag_conflict_live_feedback_and_save_blocking(workbench):
         with pytest.raises(ValueError, match="A → B → A"):
             app.save_workflow(bad)
         assert store.get_workflow("first") == workflow
+
+
+@pytest.mark.parametrize("size", [(108, 32), (120, 36), (122, 34)])
+async def test_hub_preview_four_layer_and_partial_adjacent_dag_cards(workbench, size):
+    """验证 Hub 右侧预览在首帧挂载及常规宽屏下完整绘制四层 DAG 与非完全二部相邻层拓扑图。"""
+    store, settings, _ = workbench
+    judge = deepcopy(store.get_worker("writer"))
+    judge.id = "judge"
+    store.save_worker(judge)
+    seed_flow_examples(store, judge)
+    wf_3121 = store.get_workflow("decision-3121")
+
+    app = CTFlowApp(store, settings, workflow=wf_3121, start_in_hub=True)
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        preview_text = str(app.root.query_one("#hub-preview Static", Static).render())
+        assert "╭" in preview_text and "╰" in preview_text
+        assert "┼" in preview_text and "┤" in preview_text and "├" in preview_text
+        assert "L1 起点 ─→" not in preview_text
+
+    # 验证独立双轨汇流（A→C, B→D, C+D→E）等非完全二部相邻层 DAG 同样渲染圆角卡片与连通正交线
+    parallel_tracks = Workflow(
+        "tracks",
+        "双轨并行汇流",
+        "任务",
+        [
+            Node("A", "左轨检索", "writer"),
+            Node("B", "右轨检索", "writer"),
+            Node("C", "左轨推演", "reviewer", dependencies=["A"]),
+            Node("D", "右轨推演", "reviewer", dependencies=["B"]),
+            Node("E", "综合汇流", "judge", dependencies=["C", "D"]),
+        ],
+    )
+    rendered = graph(parallel_tracks, {}, "A", 64, 0, interactive=False, compact=True).plain
+    assert "╭" in rendered and "├" in rendered and "▸" in rendered
+    assert "L1 起点 ─→" not in rendered
