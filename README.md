@@ -67,3 +67,7 @@ uv run ruff format --check src tests
 ```
 
 详细操作说明见 [入门指南](docs/入门指南.md)，内部数据流与标签协议见 [实现说明](docs/实现说明.md)，能力边界见 [实现范围](docs/实现范围.md)，核心架构演进依据见 [ADR 目录](docs/adr/0001-pure-file-storage-and-keyring.md)。
+
+### 许可证
+
+本项目基于 [MIT License](LICENSE) 开源，允许自由使用、修改、分发与商用，保留版权声明与许可声明即可。
