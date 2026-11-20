@@ -1,4 +1,9 @@
 .venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 config/config.json
 config/backups/
 extensions/mcp.json
